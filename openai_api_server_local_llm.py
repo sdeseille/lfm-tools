@@ -202,16 +202,17 @@ Available tools:
     def parse_tool_calls_from_content(self, content: str) -> List[Dict[str, Any]]:
         """
         Parse tool calls from model response content.
-        Looks for JSON objects with 'name' and 'arguments' fields.
+        Supports multiple formats:
+        1. JSON: {"name": "tool_name", "arguments": {...}}
+        2. Function call: [tool_name(param="value")]
         """
         tool_calls = []
         
-        # Pattern to match JSON-like tool calls
-        pattern = r'\{[^{}]*"name"\s*:\s*"([^"]+)"[^{}]*"arguments"\s*:\s*\{[^}]*\}[^{}]*\}'
+        # Try JSON format first
+        json_pattern = r'\{[^{}]*"name"\s*:\s*"([^"]+)"[^{}]*"arguments"\s*:\s*\{[^}]*\}[^{}]*\}'
+        json_matches = re.finditer(json_pattern, content, re.DOTALL)
         
-        matches = re.finditer(pattern, content, re.DOTALL)
-        
-        for match in matches:
+        for match in json_matches:
             try:
                 tool_call_json = match.group(0)
                 tool_call_dict = json.loads(tool_call_json)
@@ -227,6 +228,40 @@ Available tools:
                     })
             except json.JSONDecodeError:
                 continue
+        
+        # If no JSON found, try function call format: [tool_name(param="value", param2="value2")]
+        if not tool_calls:
+            func_pattern = r'\[(\w+)\((.*?)\)\]'
+            func_matches = re.finditer(func_pattern, content, re.DOTALL)
+            
+            for match in func_matches:
+                try:
+                    func_name = match.group(1)
+                    params_str = match.group(2)
+                    
+                    # Parse parameters: param="value", param2="value2"
+                    arguments = {}
+                    param_pattern = r'(\w+)="([^"]*)"'
+                    param_matches = re.finditer(param_pattern, params_str)
+                    
+                    for param_match in param_matches:
+                        param_name = param_match.group(1)
+                        param_value = param_match.group(2)
+                        arguments[param_name] = param_value
+                    
+                    # Skip if it's a generic placeholder
+                    if func_name != "tool_name" and arguments:
+                        tool_calls.append({
+                            "id": f"call_{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {
+                                "name": func_name,
+                                "arguments": json.dumps(arguments)
+                            }
+                        })
+                except Exception as e:
+                    print(f"Error parsing function call: {e}")
+                    continue
         
         return tool_calls
     
@@ -392,7 +427,7 @@ async def startup_event():
     # Load local model
     try:
         # Adjust the path to your downloaded model
-        model_path = "models/LFM2.5-230M-Q8_0.gguf"  # Update this path
+        model_path = "models/LFM2.5-230M-Q4_K_M.gguf"  # Update this path
         llm_manager.load_model(model_path, n_ctx=8192, verbose=False)
     except Exception as e:
         print(f"✗ Failed to load local model: {e}")
@@ -434,28 +469,28 @@ async def chat_completions(request: ChatCompletionRequest):
         assistant_message = result["message"]
         finish_reason = result["finish_reason"]
         
-        # If model wants to call tools, execute them
-        if assistant_message.get("tool_calls"):
-            tool_calls = assistant_message["tool_calls"]
+        # # If model wants to call tools, execute them
+        # if assistant_message.get("tool_calls"):
+        #     tool_calls = assistant_message["tool_calls"]
             
-            # Execute first tool call (you can extend this to handle multiple)
-            for tool_call in tool_calls:
-                function_name = tool_call["function"]["name"]
-                function_args = json.loads(tool_call["function"]["arguments"])
+        #     # Execute first tool call (you can extend this to handle multiple)
+        #     for tool_call in tool_calls:
+        #         function_name = tool_call["function"]["name"]
+        #         function_args = json.loads(tool_call["function"]["arguments"])
                 
-                try:
-                    # Call tool through MCP
-                    tool_result = await mcp_client.call_tool(function_name, function_args)
+        #         try:
+        #             # Call tool through MCP
+        #             tool_result = await mcp_client.call_tool(function_name, function_args)
                     
-                    # For now, include result in content
-                    # In a proper implementation, client would send tool result back
-                    if not assistant_message.get("content"):
-                        assistant_message["content"] = ""
-                    assistant_message["content"] += f"\n\nTool Result: {tool_result}"
+        #             # For now, include result in content
+        #             # In a proper implementation, client would send tool result back
+        #             if not assistant_message.get("content"):
+        #                 assistant_message["content"] = ""
+        #             assistant_message["content"] += f"\n\nTool Result: {tool_result}"
                     
-                except Exception as e:
-                    assistant_message["content"] = f"Error calling tool {function_name}: {str(e)}"
-                    finish_reason = "stop"
+        #         except Exception as e:
+        #             assistant_message["content"] = f"Error calling tool {function_name}: {str(e)}"
+        #             finish_reason = "stop"
         
         # Build OpenAI-compatible response
         response = ChatCompletionResponse(
@@ -512,6 +547,38 @@ async def list_tools():
         "object": "list",
         "data": mcp_client.tools
     }
+
+
+@app.post("/v1/tools/execute")
+async def execute_tool(request: Dict[str, Any]):
+    """
+    Execute a tool through MCP
+    
+    Request body:
+    {
+        "name": "tool_name",
+        "arguments": {"param": "value"}
+    }
+    """
+    try:
+        tool_name = request.get("name")
+        tool_arguments = request.get("arguments", {})
+        
+        if not tool_name:
+            raise HTTPException(status_code=400, detail="Tool name is required")
+        
+        # Execute through MCP
+        result = await mcp_client.call_tool(tool_name, tool_arguments)
+        
+        # Parse JSON result
+        try:
+            result_dict = json.loads(result)
+            return result_dict
+        except json.JSONDecodeError:
+            return {"result": result}
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")

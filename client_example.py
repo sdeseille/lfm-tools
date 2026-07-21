@@ -1,19 +1,19 @@
 """
-Example client to test the OpenAI-compatible API with local LLM and MCP tools
+Example client with proper tool calling loop
+Follows OpenAI's tool calling pattern
 """
 import requests
 import json
 import time
+from typing import List, Dict, Any
 
 
 class OpenAIClient:
-    """Simple client for OpenAI-compatible API"""
+    """Client for OpenAI-compatible API with tool calling support"""
     
     def __init__(self, base_url: str = "http://localhost:8000"):
         self.base_url = base_url
-        self.headers = {
-            "Content-Type": "application/json"
-        }
+        self.headers = {"Content-Type": "application/json"}
     
     def chat_completion(
         self,
@@ -41,20 +41,34 @@ class OpenAIClient:
         
         return response.json()
     
-    def list_models(self):
-        """List available models"""
-        url = f"{self.base_url}/v1/models"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
+    def execute_tool_call(self, tool_name: str, tool_arguments: dict) -> dict:
+        """
+        Execute a tool call through the MCP server endpoint
         
-        return response.json()
+        Note: This calls the server which then calls MCP.
+        In production, you might want a direct MCP client here.
+        """
+        # For now, we'll use a helper endpoint to execute tools
+        # You could also implement a direct MCP client here
+        url = f"{self.base_url}/v1/tools/execute"
+        
+        payload = {
+            "name": tool_name,
+            "arguments": tool_arguments
+        }
+        
+        try:
+            response = requests.post(url, json=payload, headers=self.headers)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            return {"error": str(e)}
     
     def list_tools(self):
         """List available tools"""
         url = f"{self.base_url}/v1/tools"
         response = requests.get(url, headers=self.headers)
         response.raise_for_status()
-        
         return response.json()
     
     def health_check(self):
@@ -62,8 +76,210 @@ class OpenAIClient:
         url = f"{self.base_url}/health"
         response = requests.get(url, headers=self.headers)
         response.raise_for_status()
-        
         return response.json()
+
+
+class ToolCallingAgent:
+    """Agent that handles the complete tool calling loop"""
+    
+    def __init__(self, client: OpenAIClient):
+        self.client = client
+        self.max_iterations = 5
+    
+    def run(
+        self,
+        user_message: str,
+        verbose: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Run a complete conversation with tool calling loop
+        
+        Returns:
+            Final response and conversation history
+        """
+        messages = [
+            {"role": "user", "content": user_message}
+        ]
+        
+        if verbose:
+            print(f"\n{'='*80}")
+            print(f"🧑 User: {user_message}")
+            print(f"{'='*80}\n")
+        
+        for iteration in range(self.max_iterations):
+            if verbose:
+                print(f"🔄 Iteration {iteration + 1}/{self.max_iterations}")
+            
+            # Get response from LLM
+            response = self.client.chat_completion(messages)
+            assistant_message = response["choices"][0]["message"]
+            finish_reason = response["choices"][0]["finish_reason"]
+            
+            if verbose:
+                print(f"🤖 Assistant Response:")
+                print(f"   Finish Reason: {finish_reason}")
+            
+            # Add assistant message to history
+            messages.append(assistant_message)
+            
+            # Check if tool calls are needed
+            tool_calls = assistant_message.get("tool_calls")
+            
+            if not tool_calls:
+                # No tool calls - this is the final answer
+                if verbose:
+                    print(f"💬 Final Answer: {assistant_message.get('content', '')}\n")
+                
+                return {
+                    "status": "completed",
+                    "final_answer": assistant_message.get("content", ""),
+                    "messages": messages,
+                    "iterations": iteration + 1
+                }
+            
+            # Execute tool calls
+            if verbose:
+                print(f"🔧 Tool Calls Detected: {len(tool_calls)}")
+            
+            for tool_call in tool_calls:
+                tool_call_id = tool_call["id"]
+                function_name = tool_call["function"]["name"]
+                function_args = json.loads(tool_call["function"]["arguments"])
+                
+                if verbose:
+                    print(f"\n   📞 Calling Tool: {function_name}")
+                    print(f"   📝 Arguments: {json.dumps(function_args, indent=6)}")
+                
+                # Execute the tool
+                tool_result = self.client.execute_tool_call(function_name, function_args)
+                
+                if verbose:
+                    print(f"   ✅ Result: {json.dumps(tool_result, indent=6)}")
+                
+                # Add tool result to messages
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": function_name,
+                    "content": json.dumps(tool_result)
+                })
+            
+            if verbose:
+                print(f"\n{'─'*80}\n")
+        
+        # Max iterations reached
+        if verbose:
+            print(f"⚠️  Max iterations ({self.max_iterations}) reached\n")
+        
+        return {
+            "status": "max_iterations_reached",
+            "final_answer": messages[-1].get("content", ""),
+            "messages": messages,
+            "iterations": self.max_iterations
+        }
+
+
+def print_conversation_history(messages: List[Dict[str, Any]]):
+    """Pretty print conversation history"""
+    print(f"\n{'='*80}")
+    print("📜 Conversation History")
+    print(f"{'='*80}\n")
+    
+    for i, msg in enumerate(messages, 1):
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        
+        if role == "user":
+            print(f"{i}. 🧑 User:")
+            print(f"   {content}\n")
+        elif role == "assistant":
+            print(f"{i}. 🤖 Assistant:")
+            if msg.get("tool_calls"):
+                print(f"   [Requesting tool calls]")
+                for tc in msg["tool_calls"]:
+                    print(f"   - {tc['function']['name']}")
+            else:
+                print(f"   {content}")
+            print()
+        elif role == "tool":
+            print(f"{i}. 🔧 Tool Result ({msg.get('name', 'unknown')}):")
+            print(f"   {content[:100]}..." if len(content) > 100 else f"   {content}")
+            print()
+
+
+# ============================================================================
+# EXAMPLES
+# ============================================================================
+
+def example_weather_with_tools():
+    """Example: Weather query with automatic tool execution"""
+    print("\n" + "="*80)
+    print("Example 1: Weather Query with Tool Calling Loop")
+    print("="*80)
+    
+    client = OpenAIClient()
+    agent = ToolCallingAgent(client)
+    
+    result = agent.run(
+        "What's the weather like in London?",
+        verbose=True
+    )
+    
+    print_conversation_history(result["messages"])
+    print(f"\n✅ Completed in {result['iterations']} iterations")
+
+
+def example_calculation_with_tools():
+    """Example: Math calculation with tool calling"""
+    print("\n" + "="*80)
+    print("Example 2: Calculation with Tool Calling Loop")
+    print("="*80)
+    
+    client = OpenAIClient()
+    agent = ToolCallingAgent(client)
+    
+    result = agent.run(
+        "Please calculate 1234 * 5678 for me",
+        verbose=True
+    )
+    
+    print_conversation_history(result["messages"])
+    print(f"\n✅ Completed in {result['iterations']} iterations")
+
+
+def example_multi_tool_query():
+    """Example: Query requiring multiple tools"""
+    print("\n" + "="*80)
+    print("Example 3: Multi-Tool Query")
+    print("="*80)
+    
+    client = OpenAIClient()
+    agent = ToolCallingAgent(client)
+    
+    result = agent.run(
+        "What's the weather in Paris and what time is it there?",
+        verbose=True
+    )
+    
+    print_conversation_history(result["messages"])
+    print(f"\n✅ Completed in {result['iterations']} iterations")
+
+
+def example_no_tools_needed():
+    """Example: Simple query without tools"""
+    print("\n" + "="*80)
+    print("Example 4: Simple Query (No Tools)")
+    print("="*80)
+    
+    client = OpenAIClient()
+    agent = ToolCallingAgent(client)
+    
+    result = agent.run(
+        "Hello! Please introduce yourself.",
+        verbose=True
+    )
+    
+    print(f"\n✅ Completed in {result['iterations']} iterations")
 
 
 def wait_for_server(client: OpenAIClient, max_retries: int = 10, delay: int = 2):
@@ -77,7 +293,7 @@ def wait_for_server(client: OpenAIClient, max_retries: int = 10, delay: int = 2)
                 return True
             else:
                 print(f"  Attempt {i+1}/{max_retries}: Model not loaded yet...")
-        except Exception as e:
+        except Exception:
             print(f"  Attempt {i+1}/{max_retries}: Server not responding...")
         
         if i < max_retries - 1:
@@ -87,179 +303,38 @@ def wait_for_server(client: OpenAIClient, max_retries: int = 10, delay: int = 2)
     return False
 
 
-def example_weather_query():
-    """Example: Query weather using tools"""
-    print("\n" + "=" * 80)
-    print("Example 1: Weather Query with Local LLM")
-    print("=" * 80)
-    
-    client = OpenAIClient()
-    
-    messages = [
-        {
-            "role": "user",
-            "content": "What's the weather like in London?"
-        }
-    ]
-    
-    print(f"\nUser: {messages[0]['content']}")
-    print("\nGenerating response from local model...")
-    
-    response = client.chat_completion(messages)
-    
-    assistant_message = response["choices"][0]["message"]
-    print(f"\nAssistant: {assistant_message.get('content', '')}")
-    
-    if assistant_message.get("tool_calls"):
-        print("\n✓ Tool calls detected:")
-        for tool_call in assistant_message["tool_calls"]:
-            print(f"  - Tool: {tool_call['function']['name']}")
-            print(f"  - Arguments: {tool_call['function']['arguments']}")
-
-
-def example_calculation():
-    """Example: Perform calculation using tools"""
-    print("\n" + "=" * 80)
-    print("Example 2: Calculation with Local LLM")
-    print("=" * 80)
-    
-    client = OpenAIClient()
-    
-    messages = [
-        {
-            "role": "user",
-            "content": "Please calculate 156 + 234 for me"
-        }
-    ]
-    
-    print(f"\nUser: {messages[0]['content']}")
-    print("\nGenerating response from local model...")
-    
-    response = client.chat_completion(messages)
-    
-    assistant_message = response["choices"][0]["message"]
-    print(f"\nAssistant: {assistant_message.get('content', '')}")
-    
-    if assistant_message.get("tool_calls"):
-        print("\n✓ Tool calls detected:")
-        for tool_call in assistant_message["tool_calls"]:
-            print(f"  - Tool: {tool_call['function']['name']}")
-            print(f"  - Arguments: {tool_call['function']['arguments']}")
-
-
-def example_time_query():
-    """Example: Get current time"""
-    print("\n" + "=" * 80)
-    print("Example 3: Time Query with Local LLM")
-    print("=" * 80)
-    
-    client = OpenAIClient()
-    
-    messages = [
-        {
-            "role": "user",
-            "content": "What time is it in UTC?"
-        }
-    ]
-    
-    print(f"\nUser: {messages[0]['content']}")
-    print("\nGenerating response from local model...")
-    
-    response = client.chat_completion(messages)
-    
-    assistant_message = response["choices"][0]["message"]
-    print(f"\nAssistant: {assistant_message.get('content', '')}")
-    
-    if assistant_message.get("tool_calls"):
-        print("\n✓ Tool calls detected:")
-        for tool_call in assistant_message["tool_calls"]:
-            print(f"  - Tool: {tool_call['function']['name']}")
-            print(f"  - Arguments: {tool_call['function']['arguments']}")
-
-
-def example_general_query():
-    """Example: General query without tools"""
-    print("\n" + "=" * 80)
-    print("Example 4: General Query (No Tools)")
-    print("=" * 80)
-    
-    client = OpenAIClient()
-    
-    messages = [
-        {
-            "role": "user",
-            "content": "Hello! Can you introduce yourself?"
-        }
-    ]
-    
-    print(f"\nUser: {messages[0]['content']}")
-    print("\nGenerating response from local model...")
-    
-    response = client.chat_completion(messages)
-    
-    assistant_message = response["choices"][0]["message"]
-    print(f"\nAssistant: {assistant_message.get('content', '')}")
-
-
-def example_system_info():
-    """Example: Display system information"""
-    print("\n" + "=" * 80)
-    print("System Information")
-    print("=" * 80)
-    
-    client = OpenAIClient()
-    
-    # Health check
-    health = client.health_check()
-    print(f"\n✓ API Health:")
-    print(f"  - Status: {health['status']}")
-    print(f"  - MCP Connected: {health['mcp_connected']}")
-    print(f"  - Model Loaded: {health['model_loaded']}")
-    print(f"  - Model Path: {health.get('model_path', 'N/A')}")
-    print(f"  - Tools Available: {health['tools_count']}")
-    
-    # List models
-    models = client.list_models()
-    print(f"\n✓ Available Models:")
-    for model in models["data"]:
-        print(f"  - {model['id']} (owned by {model['owned_by']})")
-    
-    # List tools
-    tools = client.list_tools()
-    print(f"\n✓ Available Tools:")
-    for tool in tools["data"]:
-        func = tool["function"]
-        print(f"  - {func['name']}: {func['description']}")
-
-
 if __name__ == "__main__":
-    print("=" * 80)
-    print("OpenAI-Compatible API with Local LLM - Client Examples")
-    print("=" * 80)
+    print("="*80)
+    print("OpenAI-Compatible API - Tool Calling Examples")
+    print("="*80)
     
     try:
         client = OpenAIClient()
         
-        # Wait for server to be ready
+        # Wait for server
         if not wait_for_server(client):
-            print("\n✗ Server is not ready. Please start the server first:")
-            print("  python openai_api_server_local_llm.py")
+            print("\n✗ Please start the server: python openai_api_server_local.py")
             exit(1)
         
-        # Run examples
-        example_system_info()
-        example_general_query()
-        example_weather_query()
-        example_calculation()
-        example_time_query()
+        # Show available tools
+        tools = client.list_tools()
+        print(f"\n✓ Available Tools: {len(tools['data'])}")
+        for tool in tools["data"]:
+            print(f"  - {tool['function']['name']}")
         
-        print("\n" + "=" * 80)
-        print("✓ All examples completed successfully!")
-        print("=" * 80)
+        # Run examples
+        example_no_tools_needed()
+        example_weather_with_tools()
+        example_calculation_with_tools()
+        example_multi_tool_query()
+        
+        print("\n" + "="*80)
+        print("✅ All examples completed!")
+        print("="*80)
         
     except requests.exceptions.ConnectionError:
-        print("\n✗ Error: Could not connect to API server")
-        print("  Make sure the server is running: python openai_api_server_local_llm.py")
+        print("\n✗ Could not connect to server")
+        print("  Start server: python openai_api_server_local.py")
     except Exception as e:
         print(f"\n✗ Error: {e}")
         import traceback
