@@ -50,7 +50,7 @@ class ChatCompletionRequest(BaseModel):
     messages: List[Message]
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[str] = "auto"
-    temperature: Optional[float] = 0.05
+    temperature: Optional[float] = 0.1
     max_tokens: Optional[int] = 2048
     stream: Optional[bool] = False
     top_k: Optional[int] = 50
@@ -181,9 +181,10 @@ class LocalLLMManager:
             raise
     
     def create_system_prompt(self, tools: List[Dict[str, Any]]) -> str:
-        """Minimal behavioral system prompt — tool schemas are injected by
-        the model's own chat template via the `tools=` param, not here."""
-        return "You are a helpful assistant. Use tools when they help answer the user's question; otherwise answer directly and concisely."
+        """Match LiquidAI's documented format exactly — LFM2.5 was fine-tuned
+        on this literal phrasing, not free-form tool descriptions."""
+        tools_json = [t["function"] for t in tools]
+        return f"List of tools: {json.dumps(tools_json)}"
     
     def parse_tool_calls_from_content(
         self,
@@ -192,18 +193,14 @@ class LocalLLMManager:
     ) -> List[Dict[str, Any]]:
         """
         Parse tool calls from model response content.
-        Supports multiple formats:
-        1. JSON: {"name": "tool_name", "arguments": {...}}
-        2. Function call: [tool_name(param="value")]
-
-        If `tools` (the OpenAI-style tool schema list) is provided, parsed
-        calls are validated against each tool's parameter schema — calls
-        naming an unknown tool, or supplying an enum value that isn't in
-        the schema, are dropped rather than passed downstream.
+        LFM2.5's native/default format is Pythonic, optionally wrapped in
+        <|tool_call_start|>...<|tool_call_end|> special tokens:
+            <|tool_call_start|>[tool_name(param="value")]<|tool_call_end|>
+        JSON format is only used if explicitly requested in the system prompt,
+        so we check Pythonic first.
         """
         tool_calls = []
 
-        # Build a name -> parameter-schema lookup for validation
         tools_by_name = {}
         if tools:
             for t in tools:
@@ -213,16 +210,12 @@ class LocalLLMManager:
                     tools_by_name[name] = func.get("parameters", {}).get("properties", {})
 
         def is_valid_call(name: str, arguments: dict) -> bool:
-            # Reject the literal placeholder from the prompt example
             if name == "tool_name":
                 return False
-            # If we have no schema to check against, accept (best effort)
             if not tools_by_name:
                 return True
-            # Reject calls to tools that don't exist
             if name not in tools_by_name:
                 return False
-            # Reject any enum-constrained argument whose value isn't allowed
             schema = tools_by_name[name]
             for arg_name, arg_value in arguments.items():
                 enum = schema.get(arg_name, {}).get("enum")
@@ -230,75 +223,68 @@ class LocalLLMManager:
                     return False
             return True
 
-        # --- Try JSON format first: {"name": "...", "arguments": {...}} ---
-        json_pattern = r'\{[^{}]*"name"\s*:\s*"([^"]+)"[^{}]*"arguments"\s*:\s*\{[^}]*\}[^{}]*\}'
-        json_matches = re.finditer(json_pattern, content, re.DOTALL)
+        # --- Pythonic format (LFM2.5 default), with optional special-token wrapper ---
+        func_pattern = r'(?:<\|tool_call_start\|>)?\s*\[(\w+)\((.*?)\)\]\s*(?:<\|tool_call_end\|>)?'
+        func_matches = re.finditer(func_pattern, content, re.DOTALL)
 
-        for match in json_matches:
+        for match in func_matches:
             try:
-                tool_call_json = match.group(0)
-                tool_call_dict = json.loads(tool_call_json)
+                func_name = match.group(1)
+                params_str = match.group(2)
 
-                if "name" in tool_call_dict and "arguments" in tool_call_dict:
-                    name = tool_call_dict["name"]
-                    arguments = tool_call_dict["arguments"]
+                arguments = {}
+                param_pattern = r'(\w+)="([^"]*)"'
+                for param_match in re.finditer(param_pattern, params_str):
+                    arguments[param_match.group(1)] = param_match.group(2)
 
-                    if is_valid_call(name, arguments):
-                        tool_calls.append({
-                            "id": f"call_{uuid.uuid4().hex[:8]}",
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": json.dumps(arguments)
-                            }
-                        })
-            except json.JSONDecodeError:
+                if arguments and is_valid_call(func_name, arguments):
+                    tool_calls.append({
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {
+                            "name": func_name,
+                            "arguments": json.dumps(arguments)
+                        }
+                    })
+            except Exception as e:
+                print(f"Error parsing function call: {e}")
                 continue
 
-        # --- If no JSON found, try function-call format: [tool_name(param="value")] ---
+        # --- Fallback: JSON format, only if the Pythonic pattern found nothing ---
         if not tool_calls:
-            func_pattern = r'\[(\w+)\((.*?)\)\]'
-            func_matches = re.finditer(func_pattern, content, re.DOTALL)
-
-            for match in func_matches:
+            json_pattern = r'\{[^{}]*"name"\s*:\s*"([^"]+)"[^{}]*"arguments"\s*:\s*\{[^}]*\}[^{}]*\}'
+            for match in re.finditer(json_pattern, content, re.DOTALL):
                 try:
-                    func_name = match.group(1)
-                    params_str = match.group(2)
-
-                    # Parse parameters: param="value", param2="value2"
-                    arguments = {}
-                    param_pattern = r'(\w+)="([^"]*)"'
-                    param_matches = re.finditer(param_pattern, params_str)
-
-                    for param_match in param_matches:
-                        param_name = param_match.group(1)
-                        param_value = param_match.group(2)
-                        arguments[param_name] = param_value
-
-                    if arguments and is_valid_call(func_name, arguments):
-                        tool_calls.append({
-                            "id": f"call_{uuid.uuid4().hex[:8]}",
-                            "type": "function",
-                            "function": {
-                                "name": func_name,
-                                "arguments": json.dumps(arguments)
-                            }
-                        })
-                except Exception as e:
-                    print(f"Error parsing function call: {e}")
+                    tool_call_dict = json.loads(match.group(0))
+                    if "name" in tool_call_dict and "arguments" in tool_call_dict:
+                        name = tool_call_dict["name"]
+                        arguments = tool_call_dict["arguments"]
+                        if is_valid_call(name, arguments):
+                            tool_calls.append({
+                                "id": f"call_{uuid.uuid4().hex[:8]}",
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": json.dumps(arguments)
+                                }
+                            })
+                except json.JSONDecodeError:
                     continue
 
         return tool_calls
    
     def strip_thinking_tags(self, content: str) -> str:
-        """Remove <think>...</think> tags from content"""
-        return re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL).strip()
+        """Remove <think>...</think> tags and any stray LFM tool-call tokens
+        that leaked into plain-text output."""
+        content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL)
+        content = content.replace("<|tool_call_start|>", "").replace("<|tool_call_end|>", "")
+        return content.strip()
     
     async def generate_response(
         self,
         messages: List[Message],
         tools: List[Dict[str, Any]],
-        temperature: float = 0.05,
+        temperature: float = 0.1,
         max_tokens: int = 2048,
         top_k: int = 50,
         top_p: float = 0.1,
@@ -309,6 +295,20 @@ class LocalLLMManager:
         
         if not self.model:
             raise RuntimeError("Model not loaded")
+
+        # --- Short-circuit: if the last message is a `calculate` tool result,
+        # report the number directly instead of letting the model retype it. ---
+        if messages and messages[-1].role == "tool" and messages[-1].name == "calculate":
+            try:
+                result_data = json.loads(messages[-1].content)
+                if "result" in result_data:
+                    answer = f"The result is {result_data['result']}."
+                    assistant_message = {"role": "assistant", "content": answer}
+                    if stream:
+                        return self._wrap_as_stream(assistant_message)
+                    return {"message": assistant_message, "finish_reason": "stop"}
+            except (json.JSONDecodeError, KeyError):
+                pass  # fall through to normal generation if result isn't parseable
         
         # Convert messages to llama-cpp format
         llama_messages: List[ChatCompletionRequestMessage] = []
