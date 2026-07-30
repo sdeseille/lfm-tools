@@ -170,7 +170,7 @@ class LocalLLMManager:
                 n_ctx=n_ctx,
                 n_gpu_layers=n_gpu_layers,
                 verbose=verbose,
-                chat_format="chatml"  # Use ChatML format for tool calling
+                #chat_format="chatml"  # Use ChatML format for tool calling
             )
             
             self.model_path = model_path
@@ -181,76 +181,101 @@ class LocalLLMManager:
             raise
     
     def create_system_prompt(self, tools: List[Dict[str, Any]]) -> str:
-        """Create system prompt with tool descriptions"""
-        system_prompt = """You are an AI assistant that can help users by calling available tools.
-When a user asks a question, determine if a tool should be called to help answer.
-If a tool is needed, respond with a tool call using the following JSON format:
-{"name": "tool_name", "arguments": {"param": "value"}}
-
-Available tools:
-"""
-        for tool in tools:
-            func = tool["function"]
-            system_prompt += f"\n- {func['name']}: {func['description']}"
-            if func.get('parameters'):
-                params = func['parameters'].get('properties', {})
-                system_prompt += f"\n  Parameters: {', '.join(params.keys())}"
-        
-        system_prompt += "\n\nIf no tool is needed, answer the user directly. Be concise and helpful."
-        return system_prompt
+        """Minimal behavioral system prompt — tool schemas are injected by
+        the model's own chat template via the `tools=` param, not here."""
+        return "You are a helpful assistant. Use tools when they help answer the user's question; otherwise answer directly and concisely."
     
-    def parse_tool_calls_from_content(self, content: str) -> List[Dict[str, Any]]:
+    def parse_tool_calls_from_content(
+        self,
+        content: str,
+        tools: List[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         """
         Parse tool calls from model response content.
         Supports multiple formats:
         1. JSON: {"name": "tool_name", "arguments": {...}}
         2. Function call: [tool_name(param="value")]
+
+        If `tools` (the OpenAI-style tool schema list) is provided, parsed
+        calls are validated against each tool's parameter schema — calls
+        naming an unknown tool, or supplying an enum value that isn't in
+        the schema, are dropped rather than passed downstream.
         """
         tool_calls = []
-        
-        # Try JSON format first
+
+        # Build a name -> parameter-schema lookup for validation
+        tools_by_name = {}
+        if tools:
+            for t in tools:
+                func = t.get("function", {})
+                name = func.get("name")
+                if name:
+                    tools_by_name[name] = func.get("parameters", {}).get("properties", {})
+
+        def is_valid_call(name: str, arguments: dict) -> bool:
+            # Reject the literal placeholder from the prompt example
+            if name == "tool_name":
+                return False
+            # If we have no schema to check against, accept (best effort)
+            if not tools_by_name:
+                return True
+            # Reject calls to tools that don't exist
+            if name not in tools_by_name:
+                return False
+            # Reject any enum-constrained argument whose value isn't allowed
+            schema = tools_by_name[name]
+            for arg_name, arg_value in arguments.items():
+                enum = schema.get(arg_name, {}).get("enum")
+                if enum and arg_value not in enum:
+                    return False
+            return True
+
+        # --- Try JSON format first: {"name": "...", "arguments": {...}} ---
         json_pattern = r'\{[^{}]*"name"\s*:\s*"([^"]+)"[^{}]*"arguments"\s*:\s*\{[^}]*\}[^{}]*\}'
         json_matches = re.finditer(json_pattern, content, re.DOTALL)
-        
+
         for match in json_matches:
             try:
                 tool_call_json = match.group(0)
                 tool_call_dict = json.loads(tool_call_json)
-                
+
                 if "name" in tool_call_dict and "arguments" in tool_call_dict:
-                    tool_calls.append({
-                        "id": f"call_{uuid.uuid4().hex[:8]}",
-                        "type": "function",
-                        "function": {
-                            "name": tool_call_dict["name"],
-                            "arguments": json.dumps(tool_call_dict["arguments"])
-                        }
-                    })
+                    name = tool_call_dict["name"]
+                    arguments = tool_call_dict["arguments"]
+
+                    if is_valid_call(name, arguments):
+                        tool_calls.append({
+                            "id": f"call_{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": json.dumps(arguments)
+                            }
+                        })
             except json.JSONDecodeError:
                 continue
-        
-        # If no JSON found, try function call format: [tool_name(param="value", param2="value2")]
+
+        # --- If no JSON found, try function-call format: [tool_name(param="value")] ---
         if not tool_calls:
             func_pattern = r'\[(\w+)\((.*?)\)\]'
             func_matches = re.finditer(func_pattern, content, re.DOTALL)
-            
+
             for match in func_matches:
                 try:
                     func_name = match.group(1)
                     params_str = match.group(2)
-                    
+
                     # Parse parameters: param="value", param2="value2"
                     arguments = {}
                     param_pattern = r'(\w+)="([^"]*)"'
                     param_matches = re.finditer(param_pattern, params_str)
-                    
+
                     for param_match in param_matches:
                         param_name = param_match.group(1)
                         param_value = param_match.group(2)
                         arguments[param_name] = param_value
-                    
-                    # Skip if it's a generic placeholder
-                    if func_name != "tool_name" and arguments:
+
+                    if arguments and is_valid_call(func_name, arguments):
                         tool_calls.append({
                             "id": f"call_{uuid.uuid4().hex[:8]}",
                             "type": "function",
@@ -262,9 +287,9 @@ Available tools:
                 except Exception as e:
                     print(f"Error parsing function call: {e}")
                     continue
-        
+
         return tool_calls
-    
+   
     def strip_thinking_tags(self, content: str) -> str:
         """Remove <think>...</think> tags from content"""
         return re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL).strip()
@@ -298,16 +323,14 @@ Available tools:
         # Add conversation messages
         for msg in messages:
             if msg.role == "tool":
-                # Add tool results as user messages
                 llama_messages.append({
-                    "role": "user",
-                    "content": f"Tool result from {msg.name}: {msg.content}"
+                    "role": "tool",
+                    "content": msg.content or "",
+                    "name": msg.name,
+                    "tool_call_id": msg.tool_call_id,   # make sure Message has this field
                 })
             else:
-                llama_messages.append({
-                    "role": msg.role,
-                    "content": msg.content or ""
-                })
+                llama_messages.append({"role": msg.role, "content": msg.content or ""})
         
         # Convert tools to llama-cpp format
         llama_tools = [
@@ -332,15 +355,15 @@ Available tools:
             )
             
             if stream:
-                return self._handle_streaming_response(response)
+                return self._handle_streaming_response(response, tools)
             else:
-                return self._handle_non_streaming_response(response)
+                return self._handle_non_streaming_response(response, tools)
                 
         except Exception as e:
             print(f"Error generating response: {e}")
             raise
     
-    def _handle_non_streaming_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
+    def _handle_non_streaming_response(self, response: Dict[str, Any], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Handle non-streaming response"""
         choice = response["choices"][0]
         message = choice["message"]
@@ -350,7 +373,7 @@ Available tools:
         content = self.strip_thinking_tags(content)
         
         # Parse tool calls from content
-        tool_calls = self.parse_tool_calls_from_content(content)
+        tool_calls = self.parse_tool_calls_from_content(content, tools)
         
         # Build response
         assistant_message = {
@@ -366,7 +389,7 @@ Available tools:
             "finish_reason": "tool_calls" if tool_calls else "stop"
         }
     
-    def _handle_streaming_response(self, response: Iterator[CreateChatCompletionStreamResponse]) -> Dict[str, Any]:
+    def _handle_streaming_response(self, response: Iterator[CreateChatCompletionStreamResponse], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Handle streaming response"""
         content_chunks = []
         
@@ -381,7 +404,7 @@ Available tools:
         content = self.strip_thinking_tags(content)
         
         # Parse tool calls
-        tool_calls = self.parse_tool_calls_from_content(content)
+        tool_calls = self.parse_tool_calls_from_content(content, tools)
         
         assistant_message = {
             "role": "assistant",
@@ -427,7 +450,7 @@ async def startup_event():
     # Load local model
     try:
         # Adjust the path to your downloaded model
-        model_path = "models/LFM2.5-230M-Q4_K_M.gguf"  # Update this path
+        model_path = "models/LFM2.5-230M-Q8_0.gguf"  # Update this path
         llm_manager.load_model(model_path, n_ctx=8192, verbose=False)
     except Exception as e:
         print(f"✗ Failed to load local model: {e}")
