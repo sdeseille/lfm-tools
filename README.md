@@ -20,7 +20,7 @@ dependencies = [
     "fastapi>=0.139.2",
     "gunicorn>=26.0.0",
     "llama-cpp-python>=0.3.34",
-    "mcp>=1.28.1",
+    "mcp>=1.28.1,<2.0.0",
     "pydantic>=2.13.4",
     "pytz>=2026.2",
     "requests>=2.34.2",
@@ -39,7 +39,7 @@ The MCP server runs as a subprocess and is automatically started by the API serv
 ### 2. Start the OpenAI-Compatible API Server
 
 ```bash
-python openai_api_server.py
+python openai_api_server_local_llm.py
 ```
 
 The server will start on http://localhost:8000
