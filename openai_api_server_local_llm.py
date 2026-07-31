@@ -492,29 +492,6 @@ async def chat_completions(request: ChatCompletionRequest):
         assistant_message = result["message"]
         finish_reason = result["finish_reason"]
         
-        # # If model wants to call tools, execute them
-        # if assistant_message.get("tool_calls"):
-        #     tool_calls = assistant_message["tool_calls"]
-            
-        #     # Execute first tool call (you can extend this to handle multiple)
-        #     for tool_call in tool_calls:
-        #         function_name = tool_call["function"]["name"]
-        #         function_args = json.loads(tool_call["function"]["arguments"])
-                
-        #         try:
-        #             # Call tool through MCP
-        #             tool_result = await mcp_client.call_tool(function_name, function_args)
-                    
-        #             # For now, include result in content
-        #             # In a proper implementation, client would send tool result back
-        #             if not assistant_message.get("content"):
-        #                 assistant_message["content"] = ""
-        #             assistant_message["content"] += f"\n\nTool Result: {tool_result}"
-                    
-        #         except Exception as e:
-        #             assistant_message["content"] = f"Error calling tool {function_name}: {str(e)}"
-        #             finish_reason = "stop"
-        
         # Build OpenAI-compatible response
         response = ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
