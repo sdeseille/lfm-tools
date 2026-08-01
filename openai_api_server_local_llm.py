@@ -7,6 +7,7 @@ import uuid
 import re
 from typing import List, Dict, Any, Optional, Iterator
 from datetime import datetime
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -156,7 +157,7 @@ class LocalLLMManager:
     
     def load_model(
         self,
-        model_path: str = "LiquidAI/LFM2.5-230M-GGUF",
+        model_path: str = "LiquidAI/LFM2-1.2B-Tool-F16.gguf",
         n_ctx: int = 8192,
         n_gpu_layers: int = -1,  # Use GPU if available
         verbose: bool = False
@@ -170,7 +171,9 @@ class LocalLLMManager:
                 n_ctx=n_ctx,
                 n_gpu_layers=n_gpu_layers,
                 verbose=verbose,
-                #chat_format="chatml"  # Use ChatML format for tool calling
+                # No chat_format — we build the prompt manually below and call
+                # create_completion(), not create_chat_completion(), so llama-cpp's
+                # own template handling is bypassed entirely.
             )
             
             self.model_path = model_path
@@ -181,24 +184,52 @@ class LocalLLMManager:
             raise
     
     def create_system_prompt(self, tools: List[Dict[str, Any]]) -> str:
-        """Match LiquidAI's documented format exactly — LFM2.5 was fine-tuned
-        on this literal phrasing, not free-form tool descriptions."""
-        tools_json = [t["function"] for t in tools]
-        return f"List of tools: {json.dumps(tools_json)}"
+        """Exact format LFM2-1.2B-Tool was trained on."""
+        tool_funcs = [t["function"] for t in tools]
+        return f"List of tools: <|tool_list_start|>{json.dumps(tool_funcs)}<|tool_list_end|>"
+
+    def build_raw_prompt(self, messages: List[Message], tools: List[Dict[str, Any]]) -> str:
+        """
+        Build the literal LFM2 chat format instead of trusting an
+        auto-detected Jinja template — this is the format shown verbatim
+        in the LFM2-1.2B-Tool model card.
+        """
+        parts = ["<|im_start|>system\n"]
+        parts.append(self.create_system_prompt(tools))
+        parts.append("<|im_end|>\n")
+
+        for msg in messages:
+            if msg.role == "user":
+                parts.append(f"<|im_start|>user\n{msg.content}<|im_end|>\n")
+
+            elif msg.role == "assistant":
+                if msg.tool_calls:
+                    # Reconstruct the Pythonic call(s) exactly as the model
+                    # would have emitted them, wrapped in the special tokens.
+                    calls = []
+                    for tc in msg.tool_calls:
+                        args = json.loads(tc["function"]["arguments"])
+                        arg_str = ", ".join(f'{k}="{v}"' for k, v in args.items())
+                        calls.append(f'{tc["function"]["name"]}({arg_str})')
+                    call_block = f"<|tool_call_start|>[{', '.join(calls)}]<|tool_call_end|>"
+                    trailing_text = msg.content or ""
+                    parts.append(f"<|im_start|>assistant\n{call_block}{trailing_text}<|im_end|>\n")
+                else:
+                    parts.append(f"<|im_start|>assistant\n{msg.content}<|im_end|>\n")
+
+            elif msg.role == "tool":
+                # content is already the raw JSON string from MCP — wrap it
+                # in the special tokens the doc specifies, don't re-encode it.
+                parts.append(f"<|im_start|>tool\n<|tool_response_start|>{msg.content}<|tool_response_end|><|im_end|>\n")
+
+        parts.append("<|im_start|>assistant\n")
+        return "".join(parts)
     
     def parse_tool_calls_from_content(
         self,
         content: str,
         tools: List[Dict[str, Any]] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Parse tool calls from model response content.
-        LFM2.5's native/default format is Pythonic, optionally wrapped in
-        <|tool_call_start|>...<|tool_call_end|> special tokens:
-            <|tool_call_start|>[tool_name(param="value")]<|tool_call_end|>
-        JSON format is only used if explicitly requested in the system prompt,
-        so we check Pythonic first.
-        """
+    ) -> tuple[List[Dict[str, Any]], str]:
         tool_calls = []
 
         tools_by_name = {}
@@ -210,8 +241,6 @@ class LocalLLMManager:
                     tools_by_name[name] = func.get("parameters", {}).get("properties", {})
 
         def is_valid_call(name: str, arguments: dict) -> bool:
-            if name == "tool_name":
-                return False
             if not tools_by_name:
                 return True
             if name not in tools_by_name:
@@ -223,55 +252,34 @@ class LocalLLMManager:
                     return False
             return True
 
-        # --- Pythonic format (LFM2.5 default), with optional special-token wrapper ---
-        func_pattern = r'(?:<\|tool_call_start\|>)?\s*\[(\w+)\((.*?)\)\]\s*(?:<\|tool_call_end\|>)?'
-        func_matches = re.finditer(func_pattern, content, re.DOTALL)
+        # Wrapper tokens are optional — llama-cpp-python strips special
+        # tokens from detokenized text by default, so they may or may not
+        # actually appear in `content`. Match the bracket list either way.
+        wrapper_pattern = r'(?:<\|tool_call_start\|>)?\s*\[(.*?)\]\s*(?:<\|tool_call_end\|>)?'
+        match = re.search(wrapper_pattern, content, re.DOTALL)
 
-        for match in func_matches:
-            try:
-                func_name = match.group(1)
-                params_str = match.group(2)
+        remaining_text = content
+        if match and re.search(r'\w+\(.*?\)', match.group(1)):  # confirm it looks like call syntax, not stray brackets
+            calls_str = match.group(1)
+            remaining_text = content[:match.start()] + content[match.end():]
+
+            call_pattern = r'(\w+)\((.*?)\)'
+            for call_match in re.finditer(call_pattern, calls_str):
+                func_name = call_match.group(1)
+                params_str = call_match.group(2)
 
                 arguments = {}
-                param_pattern = r'(\w+)="([^"]*)"'
-                for param_match in re.finditer(param_pattern, params_str):
+                for param_match in re.finditer(r'(\w+)="([^"]*)"', params_str):
                     arguments[param_match.group(1)] = param_match.group(2)
 
-                if arguments and is_valid_call(func_name, arguments):
+                if is_valid_call(func_name, arguments):
                     tool_calls.append({
                         "id": f"call_{uuid.uuid4().hex[:8]}",
                         "type": "function",
-                        "function": {
-                            "name": func_name,
-                            "arguments": json.dumps(arguments)
-                        }
+                        "function": {"name": func_name, "arguments": json.dumps(arguments)}
                     })
-            except Exception as e:
-                print(f"Error parsing function call: {e}")
-                continue
 
-        # --- Fallback: JSON format, only if the Pythonic pattern found nothing ---
-        if not tool_calls:
-            json_pattern = r'\{[^{}]*"name"\s*:\s*"([^"]+)"[^{}]*"arguments"\s*:\s*\{[^}]*\}[^{}]*\}'
-            for match in re.finditer(json_pattern, content, re.DOTALL):
-                try:
-                    tool_call_dict = json.loads(match.group(0))
-                    if "name" in tool_call_dict and "arguments" in tool_call_dict:
-                        name = tool_call_dict["name"]
-                        arguments = tool_call_dict["arguments"]
-                        if is_valid_call(name, arguments):
-                            tool_calls.append({
-                                "id": f"call_{uuid.uuid4().hex[:8]}",
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": json.dumps(arguments)
-                                }
-                            })
-                except json.JSONDecodeError:
-                    continue
-
-        return tool_calls
+        return tool_calls, remaining_text.strip()
    
     def strip_thinking_tags(self, content: str) -> str:
         """Remove <think>...</think> tags and any stray LFM tool-call tokens
@@ -284,157 +292,48 @@ class LocalLLMManager:
         self,
         messages: List[Message],
         tools: List[Dict[str, Any]],
-        temperature: float = 0.1,
         max_tokens: int = 2048,
-        top_k: int = 50,
-        top_p: float = 0.1,
-        repeat_penalty: float = 1.05,
         stream: bool = False
     ) -> Dict[str, Any]:
-        """Generate response from local model"""
-        
         if not self.model:
             raise RuntimeError("Model not loaded")
 
-        # --- Short-circuit: if the last message is a `calculate` tool result,
-        # report the number directly instead of letting the model retype it. ---
-        if messages and messages[-1].role == "tool" and messages[-1].name == "calculate":
-            try:
-                result_data = json.loads(messages[-1].content)
-                if "result" in result_data:
-                    answer = f"The result is {result_data['result']}."
-                    assistant_message = {"role": "assistant", "content": answer}
-                    if stream:
-                        return self._wrap_as_stream(assistant_message)
-                    return {"message": assistant_message, "finish_reason": "stop"}
-            except (json.JSONDecodeError, KeyError):
-                pass  # fall through to normal generation if result isn't parseable
-        
-        # Convert messages to llama-cpp format
-        llama_messages: List[ChatCompletionRequestMessage] = []
-        
-        # Add system message with tool descriptions
-        system_prompt = self.create_system_prompt(tools)
-        llama_messages.append({
-            "role": "system",
-            "content": system_prompt
-        })
-        
-        # Add conversation messages
-        for msg in messages:
-            if msg.role == "tool":
-                llama_messages.append({
-                    "role": "tool",
-                    "content": msg.content or "",
-                    "name": msg.name,
-                    "tool_call_id": msg.tool_call_id,   # make sure Message has this field
-                })
-            else:
-                llama_messages.append({"role": msg.role, "content": msg.content or ""})
-        
-        # Convert tools to llama-cpp format
-        llama_tools = [
-            {
-                "type": "function",
-                "function": tool["function"]
-            }
-            for tool in tools
-        ]
-        
-        try:
-            # Generate response
-            response = self.model.create_chat_completion(
-                messages=llama_messages,
-                tools=llama_tools if llama_tools else None,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                top_k=top_k,
-                top_p=top_p,
-                repeat_penalty=repeat_penalty,
-                stream=stream
-            )
-            
-            if stream:
-                return self._handle_streaming_response(response, tools)
-            else:
-                return self._handle_non_streaming_response(response, tools)
-                
-        except Exception as e:
-            print(f"Error generating response: {e}")
-            raise
-    
-    def _handle_non_streaming_response(self, response: Dict[str, Any], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Handle non-streaming response"""
-        choice = response["choices"][0]
-        message = choice["message"]
-        content = message.get("content", "")
-        
-        # Strip thinking tags
-        content = self.strip_thinking_tags(content)
-        
-        # Parse tool calls from content
-        tool_calls = self.parse_tool_calls_from_content(content, tools)
-        
-        # Build response
-        assistant_message = {
-            "role": "assistant",
-            "content": content if not tool_calls else None
-        }
-        
-        if tool_calls:
-            assistant_message["tool_calls"] = tool_calls
-        
-        return {
-            "message": assistant_message,
-            "finish_reason": "tool_calls" if tool_calls else "stop"
-        }
-    
-    def _handle_streaming_response(self, response: Iterator[CreateChatCompletionStreamResponse], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Handle streaming response"""
-        content_chunks = []
-        
-        for chunk in response:
-            delta = chunk["choices"][0]["delta"]
-            if "content" in delta and delta["content"]:
-                content_chunks.append(delta["content"])
-        
-        content = "".join(content_chunks)
-        
-        # Strip thinking tags
-        content = self.strip_thinking_tags(content)
-        
-        # Parse tool calls
-        tool_calls = self.parse_tool_calls_from_content(content, tools)
-        
-        assistant_message = {
-            "role": "assistant",
-            "content": content if not tool_calls else None
-        }
-        
-        if tool_calls:
-            assistant_message["tool_calls"] = tool_calls
-        
-        return {
-            "message": assistant_message,
-            "finish_reason": "tool_calls" if tool_calls else "stop"
-        }
+        prompt = self.build_raw_prompt(messages, tools)
 
+        output = self.model.create_completion(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=0,      # doc-recommended greedy decoding
+            stop=["<|im_end|>"],
+        )
+
+        raw_text = output["choices"][0]["text"]
+        print(f"🔍 RAW MODEL OUTPUT: {raw_text!r}")
+        tool_calls, plain_text = self.parse_tool_calls_from_content(raw_text, tools)
+
+        if tool_calls:
+            assistant_message = {"role": "assistant", "content": plain_text or None, "tool_calls": tool_calls}
+            finish_reason = "tool_calls"
+        else:
+            assistant_message = {"role": "assistant", "content": raw_text.strip()}
+            finish_reason = "stop"
+
+        return {"message": assistant_message, "finish_reason": finish_reason}
+    
 
 # ============================================================================
 # FASTAPI APPLICATION
 # ============================================================================
-
-app = FastAPI(title="OpenAI-Compatible API with Local LLM and MCP Tools")
 
 # Global instances
 mcp_client = MCPClient()
 llm_manager = LocalLLMManager()
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize MCP and local model on startup"""
-    # Connect to MCP server
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize MCP and local model on startup, close on shutdown"""
+    # --- Startup ---
     try:
         print("Connecting to MCP server...")
         await mcp_client.connect()
@@ -446,22 +345,23 @@ async def startup_event():
         print(f"✗ Failed to connect to MCP server: {e}")
         import traceback
         traceback.print_exc()
-    
-    # Load local model
+
     try:
         # Adjust the path to your downloaded model
-        model_path = "models/LFM2.5-230M-Q8_0.gguf"  # Update this path
+        model_path = "models/LFM2-1.2B-Tool-Q4_K_M.gguf"  # Update this path
         llm_manager.load_model(model_path, n_ctx=8192, verbose=False)
     except Exception as e:
         print(f"✗ Failed to load local model: {e}")
         import traceback
         traceback.print_exc()
 
+    yield
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Close connections on shutdown"""
+    # --- Shutdown ---
     await mcp_client.close()
+
+
+app = FastAPI(title="OpenAI-Compatible API with Local LLM and MCP Tools", lifespan=lifespan)
 
 
 @app.post("/v1/chat/completions")
@@ -470,22 +370,13 @@ async def chat_completions(request: ChatCompletionRequest):
     OpenAI-compatible chat completions endpoint with tool calling
     """
     try:
-        messages = request.messages
         tools = request.tools or mcp_client.tools
-        
-        # Check if last message is a tool result - need to continue conversation
-        last_message = messages[-1] if messages else None
-        needs_tool_execution = False
-        
+
         # Generate response from local model
         result = await llm_manager.generate_response(
-            messages=messages,
-            tools=tools,
-            temperature=request.temperature,
+            messages=request.messages,
+            tools=tools if tools else [],
             max_tokens=request.max_tokens,
-            top_k=request.top_k,
-            top_p=request.top_p,
-            repeat_penalty=request.repeat_penalty,
             stream=request.stream
         )
         
@@ -522,7 +413,7 @@ async def chat_completions(request: ChatCompletionRequest):
 @app.get("/v1/models")
 async def list_models():
     """List available models"""
-    model_id = "LFM2.5-230M" if llm_manager.model_path else "unknown"
+    model_id = llm_manager.model_path or "unknown"
     
     return {
         "object": "list",
@@ -599,7 +490,7 @@ async def root():
     return {
         "name": "OpenAI-Compatible API with Local LLM",
         "version": "1.0.0",
-        "model": "LiquidAI/LFM2.5-230M-GGUF",
+        "model": llm_manager.model_path or "LiquidAI/LFM2-1.2B-Tool-GGUF",
         "endpoints": {
             "chat": "/v1/chat/completions",
             "models": "/v1/models",
