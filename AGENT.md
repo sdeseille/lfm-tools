@@ -32,9 +32,10 @@ for context/rationale.
    happens — treat that warning as a regression, not noise).
 
 4. **`generate_response()` must call `create_completion()` with
-   `temperature=0`.** This is the documented setting for
-   `LFM2-1.2B-Tool`. Do not wire `request.temperature` through unless the
-   user explicitly asks for it — it was deliberately hardcoded.
+   `temperature=0`.** This is Liquid AI's documented setting for the
+   LFM2/LFM2.5 family and has held across every model tested in
+   `eval_results.jsonl`. Do not wire `request.temperature` through unless
+   the user explicitly asks for it — it was deliberately hardcoded.
 
 5. **`parse_tool_calls_from_content()` must treat
    `<|tool_call_start|>`/`<|tool_call_end|>` as OPTIONAL in the regex.**
@@ -50,11 +51,15 @@ for context/rationale.
 
 7. **Do not reintroduce an LLM-external "router" or "intent classifier"
    stage** (e.g. an encoder-based multi-label tool router) without being
-   asked. This was prototyped and deliberately abandoned — the current
-   model (`LFM2-1.2B-Tool`) handles single- and multi-tool detection
-   natively and reliably. If multi-tool accuracy regresses, first check
-   whether prompt/parsing changes broke it before reaching for
-   architecture changes.
+   asked. This was prototyped and deliberately abandoned — native
+   compound-call generation (no router) works, *given the right model*.
+   `LFM2-1.2B-Tool` (the original pick) turned out NOT to handle 3-tool
+   compound queries reliably (0/15 in `eval_results.jsonl`); the current
+   model, `LFM2.5-350M`, does (18/18). If multi-tool accuracy regresses,
+   run `eval_harness.py` before reaching for architecture changes — check
+   whether it's a prompt/parsing regression, and only after that consider
+   whether the loaded model itself is the problem (swap + re-test with the
+   harness, don't guess from one example).
 
 ## Always test after changes to these files
 
@@ -63,9 +68,10 @@ for context/rationale.
 | `build_raw_prompt()` | Full regression set (below) |
 | `parse_tool_calls_from_content()` | Full regression set, check `🔍 RAW MODEL OUTPUT` debug logs for each case |
 | `create_system_prompt()` | Full regression set |
-| `LocalLLMManager.load_model()` / GGUF path / quantization | Full regression set + confirm no `RuntimeWarning` in server startup logs |
+| `LocalLLMManager.load_model()` / GGUF path / quantization | `eval_harness.py --label <name> --repeats 3`, **not just the 4-case regression set** — that set never exercises a 3-tool query, which is exactly the case that hid `LFM2-1.2B-Tool`'s failure. Also confirm no `RuntimeWarning` in server startup logs. |
 | `mcp_server.py` (tool schemas or handlers) | Restart server fully (subprocess is spawned at startup) + full regression set |
 | `pyproject.toml` dependency versions | Full regression set; for `mcp` specifically, also confirm server startup log shows `✓ Connected to MCP server` with no `Connection closed` error |
+| `eval_harness.py` (new/changed test cases) | Re-run against at least the current default model before trusting the new case; append, don't hand-edit, `eval_results.jsonl` |
 
 ## Regression set (run via `python client_example.py` against a running server)
 
@@ -76,6 +82,12 @@ for context/rationale.
 
 All four must pass before considering a change complete. Do not report a
 task "done" on partial pass.
+
+This 4-case set is a fast smoke test only — it caps out at 2 tool calls
+and would not have caught `LFM2-1.2B-Tool`'s complete failure on 3-tool
+queries. For anything touching `LocalLLMManager.load_model()` or model
+files, `eval_harness.py` (6 cases × repeats, results in
+`eval_results.jsonl`) is the required test, not this one.
 
 ## Debugging workflow (use before guessing)
 
@@ -108,6 +120,13 @@ task "done" on partial pass.
   edit to `LocalLLMManager` or `chat_completions()`.
 - `pyproject.toml`: pin changes need the regression set re-run, no
   exceptions, even for "unrelated" dependency bumps.
+- `eval_harness.py`: safe to add new `TEST_CASES` entries. Don't change
+  the pass/fail comparison logic (`expected_tools` as an exact set match)
+  without re-validating existing entries in `eval_results.jsonl` still
+  parse under the new logic.
+- `eval_results.jsonl`: append-only. Never edit or delete existing lines
+  — it's the historical record backing model-selection decisions
+  documented in the README. New runs append automatically.
 
 ## What NOT to do without being asked
 
@@ -116,7 +135,11 @@ task "done" on partial pass.
 - Do not add authentication, rate limiting, or expose the server beyond
   `localhost` — this is a local/offline dev setup, and `calculate`'s
   `eval()`-based evaluation is not hardened for network exposure.
-- Do not swap the model to a different LFM2 variant (e.g. back to
-  LFM2.5-230M or a different Encoder model) without flagging that
-  `build_raw_prompt()`'s literal special-token format is specific to
-  `LFM2-1.2B-Tool`'s documented training format and may not transfer.
+- Do not swap the loaded model without running `eval_harness.py` against
+  the candidate first and comparing pass rate + latency via
+  `eval_harness.py --compare`. The prompt *format* transfers fine across
+  the LFM2/LFM2.5 family (confirmed across 4 models in
+  `eval_results.jsonl`) — that is not the risk. The risk is *accuracy*:
+  `LFM2-1.2B-Tool` and `LFM2.5-230M` both looked fine on a manual
+  one-off example and both failed most of the compound-query suite.
+  A single successful example is not evidence a model swap is safe.

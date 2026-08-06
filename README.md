@@ -1,9 +1,9 @@
 # lfm-tools — Local Tool-Calling LLM Server (LiquidAI LFM2 + MCP)
 
 An OpenAI-compatible `/v1/chat/completions` API, backed by a **local**
-LiquidAI LFM2 GGUF model running via `llama-cpp-python`, that calls tools
-exposed by a local **MCP (Model Context Protocol)** server. Runs fully
-offline — no cloud LLM calls.
+LiquidAI LFM2 / LFM2.5 GGUF model running via `llama-cpp-python`, that
+calls tools exposed by a local **MCP (Model Context Protocol)** server.
+Runs fully offline — no cloud LLM calls.
 
 > **If you are an AI coding agent working in this repo:** read this file in
 > full before making changes, and also read `AGENT.md` for terse
@@ -27,8 +27,8 @@ offline — no cloud LLM calls.
 │   FastAPI server                          │
 │                                            │
 │   LocalLLMManager                         │
-│     - loads LFM2-1.2B-Tool GGUF via       │
-│       llama-cpp-python                    │
+│     - loads a local LFM2 / LFM2.5 GGUF    │
+│       model via llama-cpp-python          │
 │     - builds the RAW prompt manually      │
 │       (LFM2's literal special-token       │
 │       format — see below)                 │
@@ -62,6 +62,8 @@ was a deliberate fix after repeated format mismatches — see Known Gotchas.
 | `openai_api_server_local_llm.py` | FastAPI server: OpenAI-compatible endpoint, LLM prompt building/parsing, MCP client wrapper |
 | `mcp_server.py` | MCP server exposing 3 tools over stdio: `get_weather`, `calculate`, `get_time` |
 | `client_example.py` | Reference client implementing the full tool-calling loop (`ToolCallingAgent`) against the server |
+| `eval_harness.py` | Multi-intent tool-calling regression suite — runs a fixed set of compound-query test cases N times against whichever model the server currently has loaded, tagged by `--label` |
+| `eval_results.jsonl` | Append-only results log fed by every `eval_harness.py` run. Tracked in git as the evidence behind model-selection decisions (see "Multi-intent tool-calling — model comparison" below) — do not hand-edit or truncate, only append by running the harness |
 | `pyproject.toml` | Dependencies (managed with `uv` or `pip`) |
 | `AGENT.md` | Terse directive rules for AI coding agents working in this repo |
 | `models/` | **Not tracked in git** — GGUF model files go here (see Setup) |
@@ -74,7 +76,7 @@ was a deliberate fix after repeated format mismatches — see Known Gotchas.
 
 - Python ≥ 3.12
 - Windows/Linux/macOS (developed/tested primarily on Windows 10)
-- Less than 0.7 GB disk for the model file
+- Less than 0.3 GB disk for the default model file (`LFM2.5-350M-Q4_K_M`)
 
 ### 2. Install dependencies
 
@@ -106,25 +108,33 @@ dependencies = [
 
 ### 3. Download the model
 
-This project uses **`LiquidAI/LFM2-1.2B-Tool`** (GGUF build), a model
-purpose-built by Liquid AI for concise, precise tool calling — chosen over
-smaller general-purpose LFM2.5 variants after they proved unreliable at
-compound/multi-tool queries.
+This project uses **`LiquidAI/LFM2.5-350M`** (GGUF build) by default. This
+was *not* the original choice — the project started on
+`LiquidAI/LFM2-1.2B-Tool`, a model purpose-built by Liquid AI for tool
+calling, on the assumption that a "Tool"-specific fine-tune would
+out-perform general-purpose LFM2.5 variants on compound/multi-tool
+queries. That assumption turned out to be wrong; see the model comparison
+below for the data that reversed it.
 
 Download a GGUF quantization from
-[`LiquidAI/LFM2-1.2B-Tool-GGUF`](https://huggingface.co/LiquidAI/LFM2-1.2B-Tool-GGUF)
+[`LiquidAI/LFM2.5-350M-GGUF`](https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF)
 into a local `models/` folder:
 
 ```text
-models/LFM2-1.2B-Tool-Q4_K_M.gguf
+models/LFM2.5-350M-Q4_K_M.gguf
 ```
 
-`Q4_K_M` has been empirically verified to produce correct tool-call
-formatting and argument extraction on all test queries below, at roughly
-1/4 the size of `F16`. `F16` also works if you have the disk/RAM budget and
-want maximum accuracy headroom. Update the `model_path` in the `lifespan`
-handler (`openai_api_server_local_llm.py`) to match whichever file you
-download.
+`Q4_K_M` (~200 MB) has been empirically verified via `eval_harness.py`
+(see below) to produce correct compound tool-call detection across the
+full regression suite. Update the `model_path` in `load_model()` /
+the `__main__` block (`openai_api_server_local_llm.py`) to match whichever
+file you download.
+
+If you need more headroom (longer/more ambiguous natural-language
+queries, more tools competing for attention as the toolset grows),
+`LiquidAI/LFM2.5-1.2B-Instruct` is the validated fallback — same accuracy,
+~1.6x slower. Do **not** use `LFM2-1.2B-Tool` or `LFM2.5-230M`; both failed
+most of the compound-query regression suite (see below).
 
 ### 4. Run
 
@@ -188,8 +198,13 @@ Status/introspection endpoints.
 
 ## The LFM2 tool-calling format (critical to understand before editing prompt logic)
 
-LFM2-1.2B-Tool was fine-tuned on a **specific literal prompt format**
-using special tokens. `build_raw_prompt()` reproduces it exactly:
+The LFM2 / LFM2.5 family is fine-tuned on a **specific literal prompt
+format** using special tokens. `build_raw_prompt()` reproduces it exactly.
+This format has been confirmed, via `eval_harness.py`, to work unchanged
+across `LFM2-1.2B-Tool`, `LFM2.5-230M`, `LFM2.5-350M`, and
+`LFM2.5-1.2B-Instruct` — swapping the GGUF file (and updating
+`model_path`) is enough, no prompt-building changes needed when moving
+within this family:
 
 ```text
 <|im_start|>system
@@ -219,7 +234,7 @@ Key facts:
   detection entirely.
 - Recommended decoding is **greedy, `temperature=0`** — this is hardcoded
   in `generate_response()`, not exposed as a request parameter, per
-  Liquid AI's own guidance for this model.
+  Liquid AI's own guidance for these models.
 - Tool results are re-injected as `role: "tool"` with content wrapped in
   `<|tool_response_start|>...<|tool_response_end|>` — the raw JSON string
   from MCP goes in as-is, **do not `json.dumps()` it again** (it's already
@@ -256,12 +271,22 @@ Key facts:
    it into a message `content` field must use it as-is, not
    `json.dumps()` it again.
 
-5. **Multi-tool-call turns are natively supported by the model**, and
-   `parse_tool_calls_from_content()` extracts all of them via regex
-   iteration — no need for a separate "planner" or intent-routing stage.
-   (An LFM2.5-Encoder-based routing approach was prototyped and abandoned
-   in favor of switching to `LFM2-1.2B-Tool`, which handles compound
-   queries natively and more reliably.)
+5. **Multi-tool-call turns are natively supported by the model — but not
+   by every model.** `parse_tool_calls_from_content()` extracts all calls
+   from a single generation via AST parsing, with no separate "planner" or
+   intent-routing stage. An LFM2.5-Encoder-based routing approach was
+   prototyped and abandoned early on in favor of relying on native
+   compound-call generation — that part of the decision holds up. What
+   turned out to be wrong was the model that decision was pinned to:
+   `LFM2-1.2B-Tool` reliably fires *one* tool call, degrades on 2, and
+   fails 3-tool compound queries entirely (0/15 across 5 distinct
+   3-tool test cases in `eval_results.jsonl`) — it was never actually
+   validated beyond the simplest compound case before being documented as
+   "reliable." `LFM2.5-350M` and `LFM2.5-1.2B-Instruct` pass the full
+   suite (18/18 each). See "Multi-intent tool-calling — model comparison"
+   below. The rule stands: don't reintroduce a router — but don't assume
+   any one model "handles compound queries reliably" without running
+   `eval_harness.py` against it first, either.
 
 6. **`temperature`/`top_k`/`top_p`/`repeat_penalty` in `ChatCompletionRequest`
    are currently accepted but ignored** by `generate_response()`, which
@@ -283,6 +308,31 @@ parsing, or model change:
 | "What's the weather like in London?" | 1 tool call (`get_weather`) → synthesized answer |
 | "Please calculate 1234 * 5678 for me" | 1 tool call (`calculate`) → synthesized answer with correct number |
 | "What's the weather in Paris and what time is it there?" | **2 tool calls in one turn** (`get_weather` + `get_time`) → single combined answer |
+
+---
+
+## Multi-intent tool-calling — model comparison
+
+The 4-case table above is a fast smoke test. It does **not** catch
+3-tool compound queries, which is where model choice actually mattered.
+`eval_harness.py` runs 6 cases × 3 repeats against whichever model the
+server has loaded; results accumulate in `eval_results.jsonl`
+(append-only, tracked in git as the evidence trail for this decision).
+Current data (72 runs total):
+
+| Model / quant | Pass rate | Avg latency | Notes |
+|---|---|---|---|
+| `LFM2-1.2B-Tool-Q4_K_M` | 3/18 | 13.5s | Passes the 2-tool case only. **0/15 on every 3-tool case**, regardless of phrasing (single sentence, separate sentences, French, reordered). This was the original default — see gotcha #5. |
+| `LFM2.5-230M-Q4_K_M` | 6/18 | 11.6s | Fastest, but unreliable even on the 2-tool case. Too small for this task at this quantization. |
+| `LFM2.5-1.2B-Instruct-Q4_K_M` | 18/18 | 19.8s | Fully reliable, but ~1.6x slower than the 350M pick below for no accuracy gain on this test set. |
+| **`LFM2.5-350M-Q4_K_M`** (current default) | **18/18** | **12.6s** | Best accuracy/latency trade-off found so far. |
+
+Before changing the loaded model (or its quantization), re-run
+`eval_harness.py --label <name> --repeats 3` against the candidate and
+compare with `eval_harness.py --compare` — do not judge a model swap on
+a single manual example. That's exactly how `LFM2-1.2B-Tool` ended up
+documented as "handling compound queries reliably" despite never having
+been tested against a 3-tool query.
 
 ---
 
