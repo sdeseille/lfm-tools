@@ -408,7 +408,7 @@ async def lifespan(app: FastAPI):
 
     try:
         # Adjust the path to your downloaded model
-        model_path = "models/LFM2.5-1.2B-Instruct-Q4_K_M.gguf"  # Update this path
+        model_path = "models/LFM2.5-350M-Q4_K_M.gguf"  # Update this path
         llm_manager.load_model(model_path, n_ctx=8192, verbose=False)
     except Exception as e:
         print(f"✗ Failed to load local model: {e}")
