@@ -1,6 +1,7 @@
 """
 OpenAI-compatible API server with MCP tool calling using local LiquidAI model
 """
+import ast
 import asyncio
 import json
 import uuid
@@ -240,6 +241,35 @@ class LocalLLMManager:
                 if name:
                     tools_by_name[name] = func.get("parameters", {}).get("properties", {})
 
+        def extract_arg_value(node: ast.expr, expected_type: str = None):
+            # Fast path: the model quoted/typed the value correctly, so it's
+            # a plain literal (str/int/float/bool/None) — use it as-is.
+            if isinstance(node, ast.Constant):
+                return node.value
+            # Fallback: anything else (a bare identifier the model forgot to
+            # quote, e.g. `location=Paris`, or an arithmetic expression like
+            # `expression=4 * 3`) isn't a Python literal, so ast.literal_eval
+            # would raise and we'd lose the whole call. Reconstruct the
+            # original source text instead — for the string-typed params
+            # every current tool uses, that's exactly the intended value.
+            try:
+                raw = ast.unparse(node)
+            except Exception:
+                return None
+            if expected_type == "integer":
+                try:
+                    return int(ast.literal_eval(node))
+                except (ValueError, TypeError, SyntaxError):
+                    return None
+            if expected_type == "number":
+                try:
+                    return float(ast.literal_eval(node))
+                except (ValueError, TypeError, SyntaxError):
+                    return None
+            if expected_type == "boolean":
+                return raw.strip().lower() in ("true", "1")
+            return raw
+
         def is_valid_call(name: str, arguments: dict) -> bool:
             if not tools_by_name:
                 return True
@@ -259,25 +289,55 @@ class LocalLLMManager:
         match = re.search(wrapper_pattern, content, re.DOTALL)
 
         remaining_text = content
-        if match and re.search(r'\w+\(.*?\)', match.group(1)):  # confirm it looks like call syntax, not stray brackets
+        if match and re.search(r'\w+\s*\(', match.group(1)):  # confirm it looks like call syntax, not stray brackets
             calls_str = match.group(1)
-            remaining_text = content[:match.start()] + content[match.end():]
 
-            call_pattern = r'(\w+)\((.*?)\)'
-            for call_match in re.finditer(call_pattern, calls_str):
-                func_name = call_match.group(1)
-                params_str = call_match.group(2)
+            # Parse as real Python syntax instead of regex. The old regex
+            # pair (`\w+\((.*?)\)` + `\w+="([^"]*)"`) broke on two common
+            # compound-query cases: (1) string args containing literal
+            # parens, e.g. calculate(expression="(12+3)*2") next to another
+            # call in the same bracket — the non-greedy `.*?` in the outer
+            # pattern truncated at the first `)`, splitting one call into
+            # two garbage fragments; (2) any non-string arg (int/float/bool)
+            # was silently dropped because the arg regex required quotes,
+            # which then failed `is_valid_call()` for tools with numeric
+            # params. ast.parse gives us real Python semantics for both.
+            try:
+                parsed = ast.parse(f"[{calls_str}]", mode="eval")
+                call_nodes = [n for n in parsed.body.elts if isinstance(n, ast.Call)]
+            except (SyntaxError, ValueError):
+                call_nodes = []
 
-                arguments = {}
-                for param_match in re.finditer(r'(\w+)="([^"]*)"', params_str):
-                    arguments[param_match.group(1)] = param_match.group(2)
+            if call_nodes:
+                remaining_text = content[:match.start()] + content[match.end():]
 
-                if is_valid_call(func_name, arguments):
-                    tool_calls.append({
-                        "id": f"call_{uuid.uuid4().hex[:8]}",
-                        "type": "function",
-                        "function": {"name": func_name, "arguments": json.dumps(arguments)}
-                    })
+                for node in call_nodes:
+                    if not isinstance(node.func, ast.Name):
+                        continue
+                    func_name = node.func.id
+                    schema = tools_by_name.get(func_name, {})
+
+                    arguments = {}
+                    valid_args = True
+                    for kw in node.keywords:
+                        if kw.arg is None:  # **kwargs — not a valid tool-call shape
+                            valid_args = False
+                            break
+                        expected_type = schema.get(kw.arg, {}).get("type")
+                        value = extract_arg_value(kw.value, expected_type)
+                        if value is None and not (isinstance(kw.value, ast.Constant) and kw.value.value is None):
+                            valid_args = False
+                            break
+                        arguments[kw.arg] = value
+                    if not valid_args:
+                        continue
+
+                    if is_valid_call(func_name, arguments):
+                        tool_calls.append({
+                            "id": f"call_{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {"name": func_name, "arguments": json.dumps(arguments)}
+                        })
 
         return tool_calls, remaining_text.strip()
    
@@ -348,7 +408,7 @@ async def lifespan(app: FastAPI):
 
     try:
         # Adjust the path to your downloaded model
-        model_path = "models/LFM2-1.2B-Tool-Q4_K_M.gguf"  # Update this path
+        model_path = "models/LFM2.5-1.2B-Instruct-Q4_K_M.gguf"  # Update this path
         llm_manager.load_model(model_path, n_ctx=8192, verbose=False)
     except Exception as e:
         print(f"✗ Failed to load local model: {e}")

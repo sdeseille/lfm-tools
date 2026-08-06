@@ -265,6 +265,42 @@ def example_multi_tool_query():
     print(f"\n✅ Completed in {result['iterations']} iterations")
 
 
+def example_three_tool_query():
+    """Example: Query requiring three tools"""
+    print("\n" + "="*80)
+    print("Example 4: Three-Tool Query")
+    print("="*80)
+    
+    client = OpenAIClient()
+    agent = ToolCallingAgent(client)
+    
+    result = agent.run(
+        "Calculate 4 * 3 and tell me the weather and time in New York.",
+        verbose=True
+    )
+    
+    print_conversation_history(result["messages"])
+    print(f"\n✅ Completed in {result['iterations']} iterations")
+
+
+def example_mixed_tool_query():
+    """Example: Query requiring mixed tools"""
+    print("\n" + "="*80)
+    print("Example 4: Mixed-Tool Query")
+    print("="*80)
+    
+    client = OpenAIClient()
+    agent = ToolCallingAgent(client)
+    
+    result = agent.run(
+        "Tell me the weather and time in New York and also in London.",
+        verbose=True
+    )
+    
+    print_conversation_history(result["messages"])
+    print(f"\n✅ Completed in {result['iterations']} iterations")
+
+
 def example_no_tools_needed():
     """Example: Simple query without tools"""
     print("\n" + "="*80)
@@ -327,6 +363,8 @@ if __name__ == "__main__":
         example_weather_with_tools()
         example_calculation_with_tools()
         example_multi_tool_query()
+        example_three_tool_query()
+        example_mixed_tool_query()
         
         print("\n" + "="*80)
         print("✅ All examples completed!")
