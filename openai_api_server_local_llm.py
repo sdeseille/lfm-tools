@@ -158,7 +158,7 @@ class LocalLLMManager:
     
     def load_model(
         self,
-        model_path: str = "LiquidAI/LFM2-1.2B-Tool-F16.gguf",
+        model_path: str = "LiquidAI/LFM2.5-350M-Q4_K_M.gguf",
         n_ctx: int = 8192,
         n_gpu_layers: int = -1,  # Use GPU if available
         verbose: bool = False
@@ -185,7 +185,7 @@ class LocalLLMManager:
             raise
     
     def create_system_prompt(self, tools: List[Dict[str, Any]]) -> str:
-        """Exact format LFM2-1.2B-Tool was trained on."""
+        """Exact format LFM2.5-350M was trained on."""
         tool_funcs = [t["function"] for t in tools]
         return f"List of tools: <|tool_list_start|>{json.dumps(tool_funcs)}<|tool_list_end|>"
 
@@ -193,7 +193,7 @@ class LocalLLMManager:
         """
         Build the literal LFM2 chat format instead of trusting an
         auto-detected Jinja template — this is the format shown verbatim
-        in the LFM2-1.2B-Tool model card.
+        in the LFM2.5-350M model card.
         """
         parts = ["<|im_start|>system\n"]
         parts.append(self.create_system_prompt(tools))
@@ -550,7 +550,7 @@ async def root():
     return {
         "name": "OpenAI-Compatible API with Local LLM",
         "version": "1.0.0",
-        "model": llm_manager.model_path or "LiquidAI/LFM2-1.2B-Tool-GGUF",
+        "model": llm_manager.model_path or "LiquidAI/LFM2.5-350M-GGUF",
         "endpoints": {
             "chat": "/v1/chat/completions",
             "models": "/v1/models",
