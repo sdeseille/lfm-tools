@@ -112,6 +112,8 @@ def run_case(agent: ToolCallingAgent, case: Dict[str, Any]) -> Dict[str, Any]:
         "total_iterations": result["iterations"],
         "status": result["status"],
         "elapsed_seconds": round(elapsed, 2),
+        "llm_metrics": result.get("llm_metrics", []),
+        "tool_metrics": result.get("tool_metrics", []),
     }
 
 
@@ -139,7 +141,7 @@ def run_suite(label: str, base_url: str, repeats: int, temperature: float,
 
             def chat_with_temp(messages, model="LFM2.5-230M", tools=None,
                                 tool_choice="auto", temperature=temperature,
-                                max_tokens=2048, _orig=orig_chat_completion):
+                                max_tokens=256, _orig=orig_chat_completion):
                 return _orig(messages, model=model, tools=tools,
                               tool_choice=tool_choice, temperature=temperature,
                               max_tokens=max_tokens)

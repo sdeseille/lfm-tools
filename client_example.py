@@ -25,8 +25,14 @@ class OpenAIClient:
         max_tokens: int = 2048
     ):
         """Send chat completion request"""
+
         url = f"{self.base_url}/v1/chat/completions"
-        
+
+        # ---------------------------------------------------------
+        # Build request payload
+        # ---------------------------------------------------------
+        payload_start = time.perf_counter()
+
         payload = {
             "model": model,
             "messages": messages,
@@ -35,11 +41,55 @@ class OpenAIClient:
             "temperature": temperature,
             "max_tokens": max_tokens
         }
-        
-        response = requests.post(url, json=payload, headers=self.headers)
+
+        payload_seconds = time.perf_counter() - payload_start
+
+        # ---------------------------------------------------------
+        # HTTP request / server round-trip
+        # ---------------------------------------------------------
+        request_start = time.perf_counter()
+
+        response = requests.post(
+            url,
+            json=payload,
+            headers=self.headers
+        )
+
+        request_seconds = time.perf_counter() - request_start
+
         response.raise_for_status()
-        
-        return response.json()
+
+        # ---------------------------------------------------------
+        # JSON parsing
+        # ---------------------------------------------------------
+        json_start = time.perf_counter()
+
+        result = response.json()
+
+        json_seconds = time.perf_counter() - json_start
+
+        # ---------------------------------------------------------
+        # Diagnostics
+        # ---------------------------------------------------------
+        total_seconds = payload_seconds + request_seconds + json_seconds
+
+        usage = result.get("usage", {})
+
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+
+        print(
+            f"[HTTP:chat_completion] "
+            f"request={request_seconds:.4f}s "
+            f"json={json_seconds:.4f}s "
+            f"total={total_seconds:.4f}s "
+            f"prompt_tokens={prompt_tokens} "
+            f"completion_tokens={completion_tokens} "
+            f"total_tokens={total_tokens}"
+        )
+
+        return result
     
     def execute_tool_call(self, tool_name: str, tool_arguments: dict) -> dict:
         """
@@ -109,15 +159,23 @@ class ToolCallingAgent:
         for iteration in range(self.max_iterations):
             if verbose:
                 print(f"🔄 Iteration {iteration + 1}/{self.max_iterations}")
-            
+
+            llm_start = time.perf_counter()
+
             # Get response from LLM
             response = self.client.chat_completion(messages)
             assistant_message = response["choices"][0]["message"]
             finish_reason = response["choices"][0]["finish_reason"]
-            
+
+            llm_elapsed = time.perf_counter() - llm_start
+
             if verbose:
                 print(f"🤖 Assistant Response:")
                 print(f"   Finish Reason: {finish_reason}")
+                print(
+                    f"[AGENT] LLM iteration={iteration + 1} "
+                    f"elapsed={llm_elapsed:.4f}s"
+                )
             
             # Add assistant message to history
             messages.append(assistant_message)
@@ -149,12 +207,21 @@ class ToolCallingAgent:
                 if verbose:
                     print(f"\n   📞 Calling Tool: {function_name}")
                     print(f"   📝 Arguments: {json.dumps(function_args, indent=6)}")
-                
+
+                tool_start = time.perf_counter()
+
                 # Execute the tool
                 tool_result = self.client.execute_tool_call(function_name, function_args)
-                
+
+                tool_elapsed = time.perf_counter() - tool_start
+
                 if verbose:
                     print(f"   ✅ Result: {json.dumps(tool_result, indent=6)}")
+                    print(
+                        f"[AGENT] TOOL "
+                        f"name={function_name} "
+                        f"elapsed={tool_elapsed:.4f}s"
+                    )
                 
                 # Add tool result to messages
                 messages.append({

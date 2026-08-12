@@ -6,6 +6,7 @@ import asyncio
 import json
 import uuid
 import re
+import time
 from typing import List, Dict, Any, Optional, Iterator
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -358,27 +359,122 @@ class LocalLLMManager:
         if not self.model:
             raise RuntimeError("Model not loaded")
 
+        generation_id = uuid.uuid4().hex[:8]
+        generation_start = time.perf_counter()
+
+        # ---------------------------------------------------------
+        # Prompt construction
+        # ---------------------------------------------------------
+        prompt_start = time.perf_counter()
+
         prompt = self.build_raw_prompt(messages, tools)
+
+        prompt_build_seconds = time.perf_counter() - prompt_start
+
+        prompt_chars = len(prompt)
+
+        # ---------------------------------------------------------
+        # LLM inference
+        # ---------------------------------------------------------
+        inference_start = time.perf_counter()
 
         output = self.model.create_completion(
             prompt=prompt,
             max_tokens=max_tokens,
-            temperature=0,      # doc-recommended greedy decoding
+            temperature=0,
             stop=["<|im_end|>"],
         )
 
+        inference_seconds = time.perf_counter() - inference_start
+
+        # ---------------------------------------------------------
+        # Token usage provided by llama-cpp-python
+        # ---------------------------------------------------------
+        usage = output.get("usage", {})
+
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+
+        completion_tokens_per_second = None
+
+        if completion_tokens and inference_seconds > 0:
+            completion_tokens_per_second = (
+                completion_tokens / inference_seconds
+            )
+        
+        total_tokens = usage.get("total_tokens")
+
+        # ---------------------------------------------------------
+        # Model output
+        # ---------------------------------------------------------
         raw_text = output["choices"][0]["text"]
-        print(f"🔍 RAW MODEL OUTPUT: {raw_text!r}")
-        tool_calls, plain_text = self.parse_tool_calls_from_content(raw_text, tools)
+
+        # ---------------------------------------------------------
+        # Tool-call parsing
+        # ---------------------------------------------------------
+        parsing_start = time.perf_counter()
+
+        tool_calls, plain_text = self.parse_tool_calls_from_content(
+            raw_text,
+            tools
+        )
+
+        parsing_seconds = time.perf_counter() - parsing_start
+
+        # ---------------------------------------------------------
+        # Total generation pipeline
+        # ---------------------------------------------------------
+        total_seconds = time.perf_counter() - generation_start
+
+        # ---------------------------------------------------------
+        # Diagnostics
+        # ---------------------------------------------------------
+        print(
+            f"[LLM:{generation_id}] "
+            f"prompt_build={prompt_build_seconds:.4f}s "
+            f"inference={inference_seconds:.4f}s "
+            f"parsing={parsing_seconds:.4f}s "
+            f"total={total_seconds:.4f}s "
+            f"prompt_chars={prompt_chars} "
+            f"prompt_tokens={prompt_tokens} "
+            f"completion_tokens={completion_tokens} "
+            f"completion_tok_s={completion_tokens_per_second:.2f} "
+            if completion_tokens_per_second is not None
+            else ""
+            f"total_tokens={total_tokens} "
+            f"tool_calls={len(tool_calls)}"
+        )
 
         if tool_calls:
-            assistant_message = {"role": "assistant", "content": plain_text or None, "tool_calls": tool_calls}
+            assistant_message = {
+                "role": "assistant",
+                "content": plain_text or None,
+                "tool_calls": tool_calls
+            }
             finish_reason = "tool_calls"
         else:
-            assistant_message = {"role": "assistant", "content": raw_text.strip()}
+            assistant_message = {
+                "role": "assistant",
+                "content": raw_text.strip()
+            }
             finish_reason = "stop"
 
-        return {"message": assistant_message, "finish_reason": finish_reason}
+        return {
+            "message": assistant_message,
+            "finish_reason": finish_reason,
+            "metrics": {
+                "generation_id": generation_id,
+                "prompt_build_seconds": prompt_build_seconds,
+                "inference_seconds": inference_seconds,
+                "parsing_seconds": parsing_seconds,
+                "total_seconds": total_seconds,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "completion_tokens_per_second": completion_tokens_per_second,
+                "total_tokens": total_tokens,
+                "tool_calls": len(tool_calls),
+            }
+        }
     
 
 # ============================================================================
@@ -409,7 +505,7 @@ async def lifespan(app: FastAPI):
     try:
         # Adjust the path to your downloaded model
         model_path = "models/LFM2.5-350M-Q4_K_M.gguf"  # Update this path
-        llm_manager.load_model(model_path, n_ctx=8192, verbose=False)
+        llm_manager.load_model(model_path, n_ctx=2048, verbose=True)
     except Exception as e:
         print(f"✗ Failed to load local model: {e}")
         import traceback
@@ -442,6 +538,7 @@ async def chat_completions(request: ChatCompletionRequest):
         
         assistant_message = result["message"]
         finish_reason = result["finish_reason"]
+        usage = result["metrics"]
         
         # Build OpenAI-compatible response
         response = ChatCompletionResponse(
@@ -456,9 +553,9 @@ async def chat_completions(request: ChatCompletionRequest):
                 }
             ],
             usage={
-                "prompt_tokens": 100,  # Approximate
-                "completion_tokens": 50,  # Approximate
-                "total_tokens": 150
+                "prompt_tokens": usage["prompt_tokens"] or 0,
+                "completion_tokens": usage["completion_tokens"] or 0,
+                "total_tokens": usage["total_tokens"] or 0
             }
         )
         
