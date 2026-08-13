@@ -36,31 +36,31 @@ DEFAULT_RESULTS_FILE = "eval_results.jsonl"
 # phrasing, order, or how many sentences it's split across. Extend this list
 # as you add tools or find new failure-prone phrasings.
 TEST_CASES: List[Dict[str, Any]] = [
-    # {
-    #     "id": "two_tool_shared_entity",
-    #     "prompt": "What's the weather and the time in New York?",
-    #     "expected_tools": {"get_weather", "get_time"},
-    # },
-    # {
-    #     "id": "three_tool_single_connector",
-    #     "prompt": "Calculate 4 * 3 and tell me the weather and time in New York.",
-    #     "expected_tools": {"calculate", "get_weather", "get_time"},
-    # },
-    # {
-    #     "id": "three_tool_separate_sentences",
-    #     "prompt": "Calculate 4 * 3? What's the weather and the time in New York?",
-    #     "expected_tools": {"calculate", "get_weather", "get_time"},
-    # },
-    # {
-    #     "id": "calculate_nested_parens_plus_tool",
-    #     "prompt": "What is (12+3)*2, and what's the weather in Paris?",
-    #     "expected_tools": {"calculate", "get_weather"},
-    # },
-    # {
-    #     "id": "three_tool_reordered",
-    #     "prompt": "What's the time in Tokyo, the weather in Paris, and calculate 15 / 3.",
-    #     "expected_tools": {"get_time", "get_weather", "calculate"},
-    # },
+    {
+        "id": "two_tool_shared_entity",
+        "prompt": "What's the weather and the time in New York?",
+        "expected_tools": {"get_weather", "get_time"},
+    },
+    {
+        "id": "three_tool_single_connector",
+        "prompt": "Calculate 4 * 3 and tell me the weather and time in New York.",
+        "expected_tools": {"calculate", "get_weather", "get_time"},
+    },
+    {
+        "id": "three_tool_separate_sentences",
+        "prompt": "Calculate 4 * 3? What's the weather and the time in New York?",
+        "expected_tools": {"calculate", "get_weather", "get_time"},
+    },
+    {
+        "id": "calculate_nested_parens_plus_tool",
+        "prompt": "What is (12+3)*2, and what's the weather in Paris?",
+        "expected_tools": {"calculate", "get_weather"},
+    },
+    {
+        "id": "three_tool_reordered",
+        "prompt": "What's the time in Tokyo, the weather in Paris, and calculate 15 / 3.",
+        "expected_tools": {"get_time", "get_weather", "calculate"},
+    },
     {
         "id": "three_tool_french",
         "prompt": "Calcule 4 fois 3, et donne-moi la m\u00e9t\u00e9o et l'heure \u00e0 New York.",
