@@ -6,14 +6,26 @@ import requests
 import json
 import time
 from typing import List, Dict, Any
+import os
 
 
 class OpenAIClient:
     """Client for OpenAI-compatible API with tool calling support"""
-    
-    def __init__(self, base_url: str = "http://localhost:8000"):
-        self.base_url = base_url
-        self.headers = {"Content-Type": "application/json"}
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        headers: dict | None = None,
+    ):
+        self.base_url = (
+            base_url
+            or os.getenv(
+                "LFM_TOOLS_BASE_URL",
+                "http://127.0.0.1:8000",
+            )
+        ).rstrip("/")
+
+        self.headers = headers or {"Content-Type": "application/json"}
     
     def chat_completion(
         self,
@@ -27,7 +39,7 @@ class OpenAIClient:
         """Send chat completion request"""
 
         url = f"{self.base_url}/v1/chat/completions"
-
+        print(f"[HTTP:chat_completion] url={url}")
         # ---------------------------------------------------------
         # Build request payload
         # ---------------------------------------------------------
@@ -48,6 +60,13 @@ class OpenAIClient:
         # HTTP request / server round-trip
         # ---------------------------------------------------------
         request_start = time.perf_counter()
+
+        payload_json = json.dumps(payload)
+
+        print(
+            f"[HTTP:chat_completion] "
+            f"payload_bytes={len(payload_json.encode('utf-8'))}"
+        )
 
         response = requests.post(
             url,
@@ -101,15 +120,30 @@ class OpenAIClient:
         # For now, we'll use a helper endpoint to execute tools
         # You could also implement a direct MCP client here
         url = f"{self.base_url}/v1/tools/execute"
-        
+        print(f"[HTTP:tool_execute] url={url}")
         payload = {
             "name": tool_name,
             "arguments": tool_arguments
         }
         
         try:
+            tool_start = time.perf_counter()
+
+            payload_json = json.dumps(payload)
+
+            print(
+                f"[HTTP:tool_execute] "
+                f"payload_bytes={len(payload_json.encode('utf-8'))}"
+            )
+
             response = requests.post(url, json=payload, headers=self.headers)
+            request_elapsed = time.perf_counter() - tool_start
             response.raise_for_status()
+            print(
+                f"[HTTP:tool_execute] "
+                f"name={tool_name} "
+                f"request={request_elapsed:.4f}s"
+            )
             return response.json()
         except Exception as e:
             return {"error": str(e)}

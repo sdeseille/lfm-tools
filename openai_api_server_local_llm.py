@@ -526,14 +526,28 @@ async def chat_completions(request: ChatCompletionRequest):
     OpenAI-compatible chat completions endpoint with tool calling
     """
     try:
+        request_start = time.perf_counter()
+
+        print("[SERVER:HTTP] /v1/chat/completions START")
+
         tools = request.tools or mcp_client.tools
 
         # Generate response from local model
+
+        generation_start = time.perf_counter()
+
         result = await llm_manager.generate_response(
             messages=request.messages,
             tools=tools if tools else [],
             max_tokens=request.max_tokens,
             stream=request.stream
+        )
+
+        generation_elapsed = time.perf_counter() - generation_start
+
+        print(
+            f"[SERVER:HTTP] generate_response="
+            f"{generation_elapsed:.4f}s"
         )
         
         assistant_message = result["message"]
@@ -541,6 +555,9 @@ async def chat_completions(request: ChatCompletionRequest):
         usage = result["metrics"]
         
         # Build OpenAI-compatible response
+
+        response_build_start = time.perf_counter()
+
         response = ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
             created=int(datetime.now().timestamp()),
@@ -557,6 +574,20 @@ async def chat_completions(request: ChatCompletionRequest):
                 "completion_tokens": usage["completion_tokens"] or 0,
                 "total_tokens": usage["total_tokens"] or 0
             }
+        )
+
+        response_build_elapsed = time.perf_counter() - response_build_start
+
+        print(
+            f"[SERVER:HTTP] response_build="
+            f"{response_build_elapsed:.4f}s"
+        )
+
+        total_elapsed = time.perf_counter() - request_start
+
+        print(
+            f"[SERVER:HTTP] /v1/chat/completions END "
+            f"total={total_elapsed:.4f}s"
         )
         
         return response
@@ -609,18 +640,40 @@ async def execute_tool(request: Dict[str, Any]):
     }
     """
     try:
+        tool_request_start = time.perf_counter()
+
         tool_name = request.get("name")
         tool_arguments = request.get("arguments", {})
+
+        print(
+            f"[SERVER:TOOL] START name={tool_name}"
+        )
         
         if not tool_name:
             raise HTTPException(status_code=400, detail="Tool name is required")
         
         # Execute through MCP
+        tool_start = time.perf_counter()
+
         result = await mcp_client.call_tool(tool_name, tool_arguments)
+
+        tool_elapsed = time.perf_counter() - tool_start
+
+        print(
+            f"[SERVER:TOOL] MCP elapsed="
+            f"{tool_elapsed:.4f}s"
+        )
         
         # Parse JSON result
         try:
             result_dict = json.loads(result)
+            tool_total = time.perf_counter() - tool_request_start
+
+            print(
+                f"[SERVER:TOOL] END "
+                f"name={tool_name} "
+                f"total={tool_total:.4f}s"
+            )
             return result_dict
         except json.JSONDecodeError:
             return {"result": result}
