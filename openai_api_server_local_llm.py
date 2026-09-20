@@ -159,7 +159,7 @@ class LocalLLMManager:
     
     def load_model(
         self,
-        model_path: str = "LiquidAI/LFM2.5-350M-Q4_K_M.gguf",
+        model_path: str = "LiquidAI/LFM2.5-230M-QAD-Q4_0.gguf",
         n_ctx: int = 8192,
         n_gpu_layers: int = -1,  # Use GPU if available
         verbose: bool = False
