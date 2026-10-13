@@ -103,7 +103,7 @@ files, `eval_harness.py` (6 cases × repeats, results in
   that pattern means weights failed to load and the model is running with
   random weights. This has happened before with mismatched model classes.
 - If a `pip install`/`uv sync` pulls in an unexpectedly new major version
-  of `mcp` or `transformers`, check changelogs for API-breaking rewrites
+  of `mcp`, check changelogs for API-breaking rewrites
   before assuming your code is at fault.
 
 ## File touch policy
