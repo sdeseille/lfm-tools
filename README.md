@@ -95,7 +95,6 @@ pip install -e .
 
 ```toml
 dependencies = [
-    "accelerate>=1.14.0",
     "fastapi>=0.139.2",
     "gunicorn>=26.0.0",
     "llama-cpp-python>=0.3.34",
@@ -103,8 +102,6 @@ dependencies = [
     "pydantic>=2.13.4",
     "pytz>=2026.2",
     "requests>=2.34.2",
-    "torch>=2.13.0",
-    "transformers>=5.14.1",
     "uvicorn[standard]>=0.51.0",
 ]
 ```
