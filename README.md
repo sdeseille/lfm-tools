@@ -35,8 +35,9 @@ Runs fully offline — no cloud LLM calls.
 │     - parses tool calls out of raw text   │
 │                                            │
 │   MCPClient                               │
-│     - spawns mcp_server.py as a subprocess│
-│     - stdio JSON-RPC per the MCP protocol │
+│     - connects the servers named in       │
+│       --mcp-config (stdio or HTTP)        │
+│     - offers their tools as one list      │
 └──────────┬─────────────────────────────────┘
            │ MCP stdio protocol
            ▼
@@ -61,6 +62,8 @@ was a deliberate fix after repeated format mismatches — see Known Gotchas.
 |---|---|
 | `openai_api_server_local_llm.py` | FastAPI server: OpenAI-compatible endpoint, LLM prompt building/parsing, MCP client wrapper |
 | `mcp_server.py` | MCP server exposing 3 tools over stdio: `get_weather`, `calculate`, `get_time` |
+| `mcp_config.py` | Reads the `--mcp-config` TOML file: which MCP servers to connect, over stdio or HTTP |
+| `mcp.demo.toml` | `--mcp-config` file for `mcp_server.py`'s demo tools |
 | `client_example.py` | Reference client implementing the full tool-calling loop (`ToolCallingAgent`) against the server |
 | `eval_harness.py` | Multi-intent tool-calling regression suite — runs a fixed set of compound-query test cases N times against whichever model the server currently has loaded, tagged by `--label` |
 | `eval_results.jsonl` | Append-only results log fed by every `eval_harness.py` run. Tracked in git as the evidence behind model-selection decisions (see "Multi-intent tool-calling — model comparison" below) — do not hand-edit or truncate, only append by running the harness |
@@ -138,18 +141,38 @@ most of the compound-query regression suite (see below).
 
 ### 4. Run
 
-Two options, both start the MCP server automatically as a subprocess —
-you do not need to run `mcp_server.py` separately:
+The server connects the MCP servers named in `--mcp-config`; without it
+the model is offered only the tools a request sends. `mcp.demo.toml` names
+`mcp_server.py`, which the server then starts itself:
 
 ```bash
-# Terminal 1: start the API server (spawns mcp_server.py internally)
-python openai_api_server_local_llm.py
+# Terminal 1: start the API server with the demo tools
+python openai_api_server_local_llm.py --mcp-config mcp.demo.toml
 
 # Terminal 2: run the reference client examples
 python client_example.py
 ```
 
 Server listens on `http://localhost:8000`.
+
+An `--mcp-config` file names each server under `[servers]`, by command
+(started by lfm-server, spoken to over stdio) or by URL (already running,
+over streamable HTTP):
+
+```toml
+[servers.knowledge]
+command = "shed"
+args = ["serve", "--with", "knowledge", "--read-only"]
+env = { MIND_DB = "rollupeurope" }      # added to lfm-server's environment
+
+[servers.rollupeurope]
+url = "http://127.0.0.1:8765/mcp"
+token_file = "~/.config/lfm/rollupeurope.token"   # sent as a bearer token
+```
+
+A server that fails to connect is reported at startup and skipped. Tool
+names must be unique across servers: a second server offering a name
+already taken fails to connect.
 
 ### 5. Sanity check
 
@@ -158,8 +181,8 @@ curl http://localhost:8000/health
 curl http://localhost:8000/v1/tools
 ```
 
-`health` should report `"model_loaded": true` and `"mcp_connected": true`
-before sending chat requests.
+`health` should report `"model_loaded": true`, and `"mcp_connected": true`
+when an `--mcp-config` names at least one server that connected.
 
 ---
 
@@ -168,7 +191,7 @@ before sending chat requests.
 ### `POST /v1/chat/completions`
 
 OpenAI-compatible. Standard `messages` array (`role`: `user` / `assistant`
-/ `tool`), optional `tools` (falls back to the MCP server's tool list if
+/ `tool`), optional `tools` (falls back to the configured MCP servers' tools if
 omitted). Returns `tool_calls` in the assistant message when the model
 decides a tool is needed — the caller is responsible for executing them
 and appending `role: "tool"` result messages, then calling again (see
@@ -180,8 +203,8 @@ and appending `role: "tool"` result messages, then calling again (see
 
 ### `GET /v1/tools`
 
-Lists tools discovered from the MCP server (name, description, JSON Schema
-parameters).
+Lists tools discovered from the configured MCP servers (name, description,
+JSON Schema parameters).
 
 ### `POST /v1/tools/execute`
 

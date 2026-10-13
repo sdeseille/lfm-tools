@@ -23,8 +23,9 @@ from llama_cpp import (
     Llama,
 )
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp.client.session_group import ClientSessionGroup, ServerParameters
+
+import mcp_config
 
 # ============================================================================
 # PYDANTIC MODELS - OpenAI API Compatibility
@@ -76,75 +77,61 @@ class ChatCompletionResponse(BaseModel):
 # ============================================================================
 
 class MCPClient:
-    """MCP Client wrapper for tool management"""
-    
+    """The tools of every configured MCP server, offered to the model as one list.
+
+    A server that fails to connect is reported and skipped; the others still
+    serve. Two servers offering a tool of the same name is such a failure, for
+    whichever connects second.
+    """
+
     def __init__(self):
-        self.session: Optional[ClientSession] = None
+        self.group: Optional[ClientSessionGroup] = None
         self.tools: List[Dict[str, Any]] = []
-        self.stdio_context = None
-    
-    async def connect(self, server_script_path: str = "mcp_server.py"):
-        """Connect to MCP server"""
-        import os
-        
-        server_params = StdioServerParameters(
-            command="python",
-            args=[os.path.abspath(server_script_path)],
-            env=None
-        )
-        
-        # Store context manager
-        self.stdio_context = stdio_client(server_params)
-        
-        # Enter the context
-        read_stream, write_stream = await self.stdio_context.__aenter__()
-        
-        # Create and initialize session
-        self.session = ClientSession(read_stream, write_stream)
-        await self.session.__aenter__()
-        
-        # Initialize the session
-        await self.session.initialize()
-        
-        # List available tools
-        try:
-            tools_result = await self.session.list_tools()
-            self.tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.inputSchema
-                    }
+
+    @property
+    def connected(self) -> bool:
+        return bool(self.group and self.group.sessions)
+
+    async def connect(self, servers: Dict[str, ServerParameters]):
+        self.group = ClientSessionGroup()
+        await self.group.__aenter__()
+        for name, params in servers.items():
+            try:
+                await self.group.connect_to_server(params)
+                print(f"✓ MCP server {name} connected")
+            except Exception as e:
+                print(f"✗ MCP server {name} failed: {e}")
+        self.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.description,
+                    "parameters": tool.inputSchema
                 }
-                for tool in tools_result.tools
-            ]
-        except Exception as e:
-            print(f"Error listing tools: {e}")
-            self.tools = []
-    
+            }
+            for name, tool in self.group.tools.items()
+        ]
+
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> str:
         """Call a tool through MCP"""
-        if not self.session:
-            raise RuntimeError("MCP session not initialized")
-        
-        result = await self.session.call_tool(name, arguments)
-        
+        if not self.connected:
+            raise RuntimeError("no MCP server connected")
+
+        result = await self.group.call_tool(name, arguments)
+
         # Extract text content from result
         if result.content:
             return result.content[0].text
         return json.dumps({"error": "No content returned"})
-    
+
     async def close(self):
-        """Close MCP connection"""
+        """Close MCP connections"""
         try:
-            if self.session:
-                await self.session.__aexit__(None, None, None)
-            if self.stdio_context:
-                await self.stdio_context.__aexit__(None, None, None)
+            if self.group:
+                await self.group.__aexit__(None, None, None)
         except Exception as e:
-            print(f"Error closing MCP connection: {e}")
+            print(f"Error closing MCP connections: {e}")
 
 
 # ============================================================================
@@ -491,17 +478,14 @@ llm_manager = LocalLLMManager()
 async def lifespan(app: FastAPI):
     """Initialize MCP and local model on startup, close on shutdown"""
     # --- Startup ---
-    try:
-        print("Connecting to MCP server...")
-        await mcp_client.connect()
-        print(f"✓ Connected to MCP server")
+    mcp_config_path = os.environ.get("LFM_MCP_CONFIG")
+    if mcp_config_path:
+        await mcp_client.connect(mcp_config.load(mcp_config_path))
         print(f"✓ Available tools: {len(mcp_client.tools)}")
         for tool in mcp_client.tools:
             print(f"  - {tool['function']['name']}: {tool['function']['description']}")
-    except Exception as e:
-        print(f"✗ Failed to connect to MCP server: {e}")
-        import traceback
-        traceback.print_exc()
+    else:
+        print("No --mcp-config: serving without MCP tools")
 
     try:
         # Configurable via CLI (see __main__), passed through the environment so
@@ -691,7 +675,7 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "mcp_connected": mcp_client.session is not None,
+        "mcp_connected": mcp_client.connected,
         "model_loaded": llm_manager.model is not None,
         "model_path": llm_manager.model_path,
         "tools_count": len(mcp_client.tools)
@@ -732,12 +716,22 @@ def main():
     parser.add_argument(
         "--port", type=int, default=8000,
         help="Port to bind (default: %(default)s)")
+    parser.add_argument(
+        "--mcp-config", metavar="FILE",
+        help="TOML file naming the MCP servers whose tools the model may call (default: none)")
     args = parser.parse_args()
+    if args.mcp_config:
+        try:
+            mcp_config.load(args.mcp_config)
+        except mcp_config.ConfigError as e:
+            parser.error(str(e))
 
     # uvicorn re-imports this module by name, so module globals set here are not
     # visible to the app's lifespan; hand the model settings over via the env.
     os.environ["LFM_MODEL"] = args.model
     os.environ["LFM_CTX"] = str(args.ctx)
+    if args.mcp_config:
+        os.environ["LFM_MCP_CONFIG"] = args.mcp_config
 
     uvicorn.run(
         "openai_api_server_local_llm:app",

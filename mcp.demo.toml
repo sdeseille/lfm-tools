@@ -1,0 +1,5 @@
+# The demo tools client_example.py and eval_harness.py expect. Run from the repo root:
+#   lfm-server --mcp-config mcp.demo.toml
+[servers.demo]
+command = "python"
+args = ["mcp_server.py"]
